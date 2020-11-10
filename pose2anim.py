@@ -5,12 +5,11 @@ from string import Template
 
 ############################################ CONSTANTS ############################################
 FRAME_RATE = 30
-MIN_CONFIDENCE = 0.75
-NUM_FRAMES_AVERAGE = 4
+MIN_CONFIDENCE = 0.5
+NUM_FRAMES_AVERAGE = 5
 ZERO_DEGREE_OFFSET = 90
 
 OPENPOSE_PATH = "OpenPose"
-RESULTS_FOLDER_NAME = "Results"
 
 ANIM_FILE_TEMPLATE = '''%YAML 1.1
 %TAG !u! tag:unity3d.com,2011:
@@ -28,14 +27,7 @@ AnimationClip:
   m_RotationCurves: []
   m_CompressedRotationCurves: []
   m_EulerCurves:
-  - curve:
-      serializedVersion: 2
-      m_Curve:
-$EULER_CURVE      m_PreInfinity: 2    
-      m_PostInfinity: 2
-      m_RotationOrder: 4
-    path: $PATH
-  m_PositionCurves: []
+$EULER_CURVES  m_PositionCurves: []
   m_ScaleCurves: []
   m_FloatCurves: []
   m_PPtrCurves: []
@@ -75,22 +67,22 @@ $EULER_CURVE      m_PreInfinity: 2
     m_HeightFromFeet: 0
     m_Mirror: 0
   m_EditorCurves:
-  - curve:
-      serializedVersion: 2
-      m_Curve:
-$EDITOR_CURVE      m_PreInfinity: 2
-      m_PostInfinity: 2
-      m_RotationOrder: 4
-    attribute: $ATTR
-    path: $PATH
-    classID: 4
-    script: {fileID: 0}
+$EDITOR_CURVES  m_EulerEditorCurves: []
   m_HasGenericRootTransform: 0
   m_HasMotionFloatCurves: 0
   m_Events: []
 '''
 
-EULER_CURVE_TEMPLATE = '''      - serializedVersion: 3
+EULER_CURVE_TEMPLATE = '''  - curve:
+      serializedVersion: 2
+      m_Curve:
+$CURVE      m_PreInfinity: 2    
+      m_PostInfinity: 2
+      m_RotationOrder: 4
+    path: $PATH
+'''
+
+EULER_CURVE_KEY_TEMPLATE = '''      - serializedVersion: 3
         time: $TIME
         value: $VALUE
         inSlope: $SLOPE
@@ -101,7 +93,19 @@ EULER_CURVE_TEMPLATE = '''      - serializedVersion: 3
         outWeight: {x: 0, y: 0, z: 0.5}
 '''
 
-EDITOR_CURVE_TEMPLATE = '''      - serializedVersion: 3
+EDITOR_CURVE_TEMPLATE = '''  - curve:
+      serializedVersion: 2
+      m_Curve:
+$CURVE      m_PreInfinity: 2
+      m_PostInfinity: 2
+      m_RotationOrder: 4
+    attribute: $ATTR
+    path: $PATH
+    classID: 4
+    script: {fileID: 0}
+'''
+
+EDITOR_CURVE_KEY_TEMPLATE = '''      - serializedVersion: 3
         time: $TIME
         value: $VALUE
         inSlope: $SLOPE
@@ -131,7 +135,7 @@ def exe_OpenPose(in_path, out_path):
 
 ###################### Process poses ######################
 def process_poses(in_path, out_path, person_idx):
-	bones_values = [[]] * len(BONES_SETTINGS)
+	bones_values = [[] for _ in range(len(BONES_SETTINGS))]
 	ini_time = -1
 	time = 0
 	num_frames = 0
@@ -145,13 +149,13 @@ def process_poses(in_path, out_path, person_idx):
 			with open(file_path) as frame_file:
 				frame_values = json.load(frame_file)
 				time = num_correct_frames * (1 / FRAME_RATE)
-				contains_data = compute_bones_values(frame_values, person_idx, time, bones_values)
+				contains_data = get_bones_values(frame_values, person_idx, time, bones_values)
 				if contains_data and ini_time == -1:
 					num_correct_frames += 1
 				num_frames += 1
 
-	# Post-process
-	bones_values = postprocess_bones_values(bones_values)
+	# Process bones_values, computing averages and slopes
+	process_bones_values(bones_values)
 
 	# Write animation
 	file_name = os.path.splitext(os.path.basename(in_path))[0]
@@ -162,23 +166,44 @@ def process_poses(in_path, out_path, person_idx):
 
 
 ########### Compute bones values ###########
-def compute_bones_values(frame_values, person_idx, time, bones_values):
+def get_bones_values(frame_values, person_idx, time, bones_values):
 	contains_data = False
+	default_slope = 0
 
 	people = frame_values["people"]
 	if len(people) > person_idx:
 		keypoints = people[person_idx]["pose_keypoints_2d"]
 		for i, bone_setting in enumerate(BONES_SETTINGS):
-			ini = get_kp(keypoints, bone_setting[0])
-			end = get_kp(keypoints, bone_setting[1])
+			# Manage parent value
+			parent_idx = bone_setting[2]
+			needs_parent = parent_idx != -1
+			has_parent = False
+			if needs_parent:
+				parent_bone = bones_values[parent_idx]
+				has_parent = len(parent_bone) > 0
+				if has_parent:
+					parent_values = parent_bone[-1]
+					has_parent = parent_values[0] == time   # Last frame is the current
 
-			if ini and end:
+			is_correct = not needs_parent or has_parent
+			if is_correct:
+				ini = get_kp(keypoints, bone_setting[0])
+				end = get_kp(keypoints, bone_setting[1])
+
+				if ini and end:
+					offset = kp_sub(end, ini)
+					angle = math.atan2(offset[1], offset[0])
+					angle = math.degrees(angle) - ZERO_DEGREE_OFFSET
+					if has_parent:
+						angle -= parent_values[1]
+					angle = angle % 360
+					bones_values[i].append([time, angle, default_slope])
+			# Exception with first frame
+			elif time == 0:
+				bones_values[i].append([time, bone_setting[4], default_slope])
+
+			if is_correct or time == 0 and not contains_data:
 				contains_data = True
-				offset = kp_sub(end, ini)
-				angle = math.atan2(offset[1], offset[0])
-				angle = math.degrees(angle) - ZERO_DEGREE_OFFSET
-
-				bones_values[i].append((time, angle))
 
 	return contains_data
 
@@ -210,45 +235,60 @@ def kp_sub(a, b):
 	return [a[0] - b[0], a[1] - b[1]]
 
 
-########### Post-process bones values ###########
-def postprocess_bones_values(bones_values):
-	output = [[]] * len(BONES_SETTINGS)
-	ini = 0
-	end = NUM_FRAMES_AVERAGE
-	for i, bone_values in enumerate(bones_values):
+########### Process bones values ###########
+def process_bones_values(bones_values):
+	for i in range(len(bones_values)):
+		bone_values = bones_values[i]
 		num_bone_values = len(bone_values)
-		# Compute average
-		while end < num_bone_values:
-			average = bone_values_average(bone_values[ini:end])
-			output[i].append(average)
-			ini += NUM_FRAMES_AVERAGE
-			end += NUM_FRAMES_AVERAGE
 
-		# Last average
-		if ini < num_bone_values - 1:
-			average = bone_values_average(bone_values[ini:num_bone_values])
-			output[i].append(average)
+		if num_bone_values != 0:
+			# Compute averages if is needed
+			if NUM_FRAMES_AVERAGE != 1:
+				ini = 0
+				end = NUM_FRAMES_AVERAGE
+				key_idx = 0
 
-		# Get slope
-		for key_idx, values in enumerate(output[i]):
-			values[2] = get_anim_slope(output[i], key_idx)
+				is_last = end >= num_bone_values
+				while not is_last:
+					is_last = end >= num_bone_values
+					bone_values[key_idx] = bone_values_average(bone_values[ini:end], is_last)
+					ini += NUM_FRAMES_AVERAGE
+					end = min(end + NUM_FRAMES_AVERAGE, num_bone_values)
+					key_idx += 1
 
-	return output
+				# Update bone values, only catching the averages values
+				bones_values[i] = bone_values = bone_values[:key_idx]
+
+			# Compute slope
+			for key_idx, key_value in enumerate(bone_values):
+				key_value[2] = compute_slope(bone_values, key_idx)
 
 
-def bone_values_average(bone_values):
-	num_values = float(len(bone_values))
-	first_time = bone_values[0][0]
-	average = [first_time, 0, 0]
+def bone_values_average(bone_values, is_last=False):
+	average = [0, 0, 0]
 
-	for time, value in bone_values:
+	# Set time and check if is first or is_last
+	is_first = bone_values[0][0] == 0
+	compute_time_average = not(is_first or is_last)
+	if not is_first and is_last:
+		average[0] = bone_values[-1][0]
+
+	# Sum values
+	for time, value, slope in bone_values:
+		if compute_time_average:
+			average[0] = average[0] + time
 		average[1] = average[1] + value
+
+	# Compute averages
+	num_values = float(len(bone_values))
+	if compute_time_average:
+		average[0] /= num_values
 	average[1] /= num_values
 
 	return average
 
 
-def get_anim_slope(bone_values, key_idx):
+def compute_slope(bone_values, key_idx):
 	slope = 0
 
 	if key_idx != 0 and key_idx != len(bone_values) - 1:
@@ -261,30 +301,42 @@ def get_anim_slope(bone_values, key_idx):
 
 ########### Write animation ###########
 def write_anim(bones_values, duration, file_path):
-	euler_curve_str = ''
-	euler_tmpl = Template(EULER_CURVE_TEMPLATE)
-	editor_curve_str = ''
-	editor_tmpl = Template(EDITOR_CURVE_TEMPLATE)
-	tmpl_values = {'TIME': 0, 'VALUE': 0, 'SLOPE': 0}
+	euler_curve_tmpl = Template(EULER_CURVE_TEMPLATE)
+	euler_curves_str = ''
+	euler_keys_tmpl = Template(EULER_CURVE_KEY_TEMPLATE)
+	euler_keys_str = ''
+	editor_curve_tmpl = Template(EDITOR_CURVE_TEMPLATE)
+	editor_curves_str = ''
+	editor_keys_tmpl = Template(EDITOR_CURVE_KEY_TEMPLATE)
+	editor_keys_str = ''
+	curve_tmpl_values = {'CURVE': '', 'PATH': '', 'ATTR': 'localEulerAnglesRaw.z'}
+	key_tmpl_values = {'TIME': 0, 'VALUE': 0, 'SLOPE': 0}
 
-	for bone_values in bones_values:
-		# TODO : Multiple bones
-		for time, value, slope in bone_values:
-			tmpl_values['TIME'] = '%.2f' % time
-			tmpl_values['VALUE'] = '{x: 0, y: 0, z: ' + value.__str__() + '}'
-			tmpl_values['SLOPE'] = '{x: 0, y: 0, z: ' + slope.__str__() + '}'
-			euler_curve_str += euler_tmpl.substitute(tmpl_values)
-			tmpl_values['VALUE'] = value
-			tmpl_values['SLOPE'] = slope
-			editor_curve_str += editor_tmpl.substitute(tmpl_values)
+	for bone_idx, bone_values in enumerate(bones_values):
+		if len(bone_values) != 0:
+			for time, value, slope in bone_values:
+				key_tmpl_values['TIME'] = '%.2f' % time
+				key_tmpl_values['VALUE'] = '{x: 0, y: 0, z: ' + value.__str__() + '}'
+				key_tmpl_values['SLOPE'] = '{x: 0, y: 0, z: ' + slope.__str__() + '}'
+				euler_keys_str += euler_keys_tmpl.substitute(key_tmpl_values)
+				key_tmpl_values['VALUE'] = value
+				key_tmpl_values['SLOPE'] = slope
+				editor_keys_str += editor_keys_tmpl.substitute(key_tmpl_values)
+
+			curve_tmpl_values['PATH'] = BONES_SETTINGS[bone_idx][3]
+			curve_tmpl_values['CURVE'] = euler_keys_str
+			euler_curves_str += euler_curve_tmpl.substitute(curve_tmpl_values)
+			curve_tmpl_values['CURVE'] = editor_keys_str
+			editor_curves_str += editor_curve_tmpl.substitute(curve_tmpl_values)
+			euler_keys_str = ''
+			editor_curves_str = ''
 
 	file_tmpl = Template(ANIM_FILE_TEMPLATE)
 	anim_name = os.path.splitext(os.path.basename(file_path))[0]
 	tmpl_values = {'NAME': anim_name,
-	               'EULER_CURVE': euler_curve_str,
-	               'PATH': BONES_SETTINGS[0][3],  # TODO : Multiple bones
+	               'EULER_CURVES': euler_curves_str,
 	               'DURATION': duration,
-	               'EDITOR_CURVE': editor_curve_str,
+	               'EDITOR_CURVES': editor_curves_str,
 	               'ATTR': 'localEulerAnglesRaw.z'}
 	file_content = file_tmpl.substitute(tmpl_values)
 
@@ -295,15 +347,23 @@ def write_anim(bones_values, duration, file_path):
 
 ############################################ MAIN ############################################
 if __name__ == "__main__":
-	IN_PATH = "E:/PROYECTOS/Pose2Anim/Input/Benet.mp4"
+	IN_PATH = "E:/PROYECTOS/Pose2Anim/Input/Legs.mp4"
 	OUT_PATH = "E:/PROYECTOS/1-UNITY/Pose2Anim/Assets/Cop"
-	BONES_SETTINGS = [(0, 15.5, -1, 'bone_1/bone_2/bone_3')]
+	BONES_SETTINGS = [(0, 15.5, -1, 'bone_1/bone_2/bone_3', 0),
+	                  (2, 3, -1, 'bone_1/bone_2/bone_6', 180),
+	                  (3, 4, 1, 'bone_1/bone_2/bone_6/bone_7', 0),
+	                  (5, 6, -1, 'bone_1/bone_2/bone_4', 180),
+	                  (6, 7, 3, 'bone_1/bone_2/bone_4/bone_5', 0),
+	                  (9, 10, -1, 'bone_1/bone_8', 0),
+	                  (10, 11, 5, 'bone_1/bone_8/bone_9', 0),
+	                  (12, 13, -1, 'bone_1/bone_10', 0),
+	                  (13, 14, 7, 'bone_1/bone_10/bone_11', 0)]
 
 	file_name = os.path.splitext(os.path.basename(IN_PATH))[0]
-	OUT_PATH = os.path.join(OUT_PATH, file_name)
+	OUT_POSES_PATH = os.path.join(OUT_PATH, file_name)
+	OUT_POSES_PATH = os.path.normpath(OUT_POSES_PATH)
 
-	if not os.path.exists(OUT_PATH):
-		detect_poses(IN_PATH, OUT_PATH)
+	if not os.path.exists(OUT_POSES_PATH):
+		detect_poses(IN_PATH, OUT_POSES_PATH)
 
-	result_path = os.path.join(OUT_PATH, RESULTS_FOLDER_NAME)
-	process_poses(OUT_PATH, result_path, 0)
+	process_poses(OUT_POSES_PATH, OUT_PATH, 0)
