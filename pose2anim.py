@@ -5,11 +5,11 @@ from string import Template
 
 ############################################ CONSTANTS ############################################
 FRAME_RATE = 30
-MIN_CONFIDENCE = 0.5
-NUM_FRAMES_AVERAGE = 5
-ZERO_DEGREE_OFFSET = 90
+MIN_CONFIDENCE = 0.6
+NUM_FRAMES_AVERAGE = 4
+BODY_ORIENTATION = 90
 
-OPENPOSE_PATH = "OpenPose"
+OPENPOSE_PATH = "OpenPose1.6.0"
 
 ANIM_FILE_TEMPLATE = '''%YAML 1.1
 %TAG !u! tag:unity3d.com,2011:
@@ -127,19 +127,20 @@ def detect_poses(in_path, out_path):
 
 
 def exe_OpenPose(in_path, out_path):
-	command = f"start bin/OpenPoseDemo.exe --keypoint_scale 3 --video {in_path} --write_json {out_path}"
+	command = f"start bin/OpenPoseDemo.exe --keypoint_scale 3 --video {in_path} --write_json {out_path} --write_video Benet.avi"
 	print(command)
 	stream = os.popen(command)
 	stream.read()
 
 
 ###################### Process poses ######################
-def process_poses(in_path, out_path, person_idx):
-	bones_values = [[] for _ in range(len(BONES_SETTINGS))]
-	ini_time = -1
+def process_poses(in_path, out_path, bones_settings, person_idx):
+	bones_values = [[] for _ in range(len(bones_settings))]
 	time = 0
 	num_frames = 0
+	first_correct_frame = -1
 	num_correct_frames = 0
+	second_per_frame = 1 / FRAME_RATE
 
 	# Read bones values
 	file_names = os.listdir(in_path)
@@ -148,10 +149,12 @@ def process_poses(in_path, out_path, person_idx):
 			file_path = os.path.join(in_path, file_name)
 			with open(file_path) as frame_file:
 				frame_values = json.load(frame_file)
-				time = num_correct_frames * (1 / FRAME_RATE)
-				contains_data = get_bones_values(frame_values, person_idx, time, bones_values)
-				if contains_data and ini_time == -1:
+				time = (num_frames - max(0, first_correct_frame)) * second_per_frame
+				contains_data = get_bones_values(frame_values, bones_settings, person_idx, time, bones_values)
+				if contains_data:
 					num_correct_frames += 1
+					if first_correct_frame == -1:
+						first_correct_frame = num_frames
 				num_frames += 1
 
 	# Process bones_values, computing averages and slopes
@@ -160,20 +163,20 @@ def process_poses(in_path, out_path, person_idx):
 	# Write animation
 	file_name = os.path.splitext(os.path.basename(in_path))[0]
 	file_path = os.path.join(out_path, f"{file_name}{person_idx}.anim")
-	write_anim(bones_values, time, file_path)
+	write_anim(bones_values, bones_settings, time, file_path)
 
 	print(f"{num_correct_frames} / {num_frames}")
 
 
-########### Compute bones values ###########
-def get_bones_values(frame_values, person_idx, time, bones_values):
+######## Compute bones values ########
+def get_bones_values(frame_values, bones_settings, person_idx, time, bones_values):
 	contains_data = False
 	default_slope = 0
 
 	people = frame_values["people"]
 	if len(people) > person_idx:
 		keypoints = people[person_idx]["pose_keypoints_2d"]
-		for i, bone_setting in enumerate(BONES_SETTINGS):
+		for i, bone_setting in enumerate(bones_settings):
 			# Manage parent value
 			parent_idx = bone_setting[2]
 			needs_parent = parent_idx != -1
@@ -193,12 +196,24 @@ def get_bones_values(frame_values, person_idx, time, bones_values):
 				if ini and end:
 					offset = kp_sub(end, ini)
 					angle = math.atan2(offset[1], offset[0])
-					angle = math.degrees(angle) - ZERO_DEGREE_OFFSET
+					angle = math.degrees(angle) - BODY_ORIENTATION
 					if has_parent:
 						angle -= parent_values[1]
 					angle = angle % 360
+
+					# Use the more similar angle to the previous
+					if len(bones_values[i]) > 0:
+						previous_angle = bones_values[i][-1][1]
+						possible_angles = [angle + 360, angle - 360]
+						min_diff = abs(angle - previous_angle)
+						for possible_angle in possible_angles:
+							diff = abs(possible_angle - previous_angle)
+							if diff < min_diff:
+								min_diff = diff
+								angle = possible_angle
+
 					bones_values[i].append([time, angle, default_slope])
-			# Exception with first frame
+			# Exception with first frame TODO : Check
 			elif time == 0:
 				bones_values[i].append([time, bone_setting[4], default_slope])
 
@@ -300,7 +315,7 @@ def compute_slope(bone_values, key_idx):
 
 
 ########### Write animation ###########
-def write_anim(bones_values, duration, file_path):
+def write_anim(bones_values, bones_settings, duration, file_path):
 	euler_curve_tmpl = Template(EULER_CURVE_TEMPLATE)
 	euler_curves_str = ''
 	euler_keys_tmpl = Template(EULER_CURVE_KEY_TEMPLATE)
@@ -323,7 +338,7 @@ def write_anim(bones_values, duration, file_path):
 				key_tmpl_values['SLOPE'] = slope
 				editor_keys_str += editor_keys_tmpl.substitute(key_tmpl_values)
 
-			curve_tmpl_values['PATH'] = BONES_SETTINGS[bone_idx][3]
+			curve_tmpl_values['PATH'] = bones_settings[bone_idx][3]
 			curve_tmpl_values['CURVE'] = euler_keys_str
 			euler_curves_str += euler_curve_tmpl.substitute(curve_tmpl_values)
 			curve_tmpl_values['CURVE'] = editor_keys_str
@@ -346,8 +361,19 @@ def write_anim(bones_values, duration, file_path):
 
 
 ############################################ MAIN ############################################
+def main(in_path, out_path, bones_settings):
+	file_name = os.path.splitext(os.path.basename(in_path))[0]
+	out_poses_path = os.path.join(out_path, file_name)
+	out_poses_path = os.path.normpath(out_poses_path)
+
+	if not os.path.exists(out_poses_path):
+		detect_poses(in_path, out_poses_path)
+
+	process_poses(out_poses_path, out_path, bones_settings, 0)
+
+
 if __name__ == "__main__":
-	IN_PATH = "E:/PROYECTOS/Pose2Anim/Input/Legs.mp4"
+	IN_PATH = "E:/PROYECTOS/Pose2Anim/Input/Benet.mp4"
 	OUT_PATH = "E:/PROYECTOS/1-UNITY/Pose2Anim/Assets/Cop"
 	BONES_SETTINGS = [(0, 15.5, -1, 'bone_1/bone_2/bone_3', 0),
 	                  (2, 3, -1, 'bone_1/bone_2/bone_6', 180),
@@ -359,11 +385,4 @@ if __name__ == "__main__":
 	                  (12, 13, -1, 'bone_1/bone_10', 0),
 	                  (13, 14, 7, 'bone_1/bone_10/bone_11', 0)]
 
-	file_name = os.path.splitext(os.path.basename(IN_PATH))[0]
-	OUT_POSES_PATH = os.path.join(OUT_PATH, file_name)
-	OUT_POSES_PATH = os.path.normpath(OUT_POSES_PATH)
-
-	if not os.path.exists(OUT_POSES_PATH):
-		detect_poses(IN_PATH, OUT_POSES_PATH)
-
-	process_poses(OUT_POSES_PATH, OUT_PATH, 0)
+	main(IN_PATH, OUT_PATH, BONES_SETTINGS)
