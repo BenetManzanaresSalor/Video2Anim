@@ -4,12 +4,12 @@ import math
 from string import Template
 
 ############################################ CONSTANTS ############################################
-FRAME_RATE = 30
+FRAME_RATE = 25
 MIN_CONFIDENCE = 0.6
-NUM_FRAMES_AVERAGE = 4
+MAX_KEYS_PER_SECOND = 5
 BODY_ORIENTATION = 90
 
-OPENPOSE_PATH = "OpenPose1.6.0"
+OPENPOSE_PATH = "openpose"
 
 ANIM_FILE_TEMPLATE = '''%YAML 1.1
 %TAG !u! tag:unity3d.com,2011:
@@ -213,11 +213,8 @@ def get_bones_values(frame_values, bones_settings, person_idx, time, bones_value
 								angle = possible_angle
 
 					bones_values[i].append([time, angle, default_slope])
-			# Exception with first frame TODO : Check
-			elif time == 0:
-				bones_values[i].append([time, bone_setting[4], default_slope])
 
-			if is_correct or time == 0 and not contains_data:
+			if is_correct and not contains_data:
 				contains_data = True
 
 	return contains_data
@@ -253,39 +250,50 @@ def kp_sub(a, b):
 ########### Process bones values ###########
 def process_bones_values(bones_values):
 	for i in range(len(bones_values)):
-		bone_values = bones_values[i]
-		num_bone_values = len(bone_values)
+		bone_keys = bones_values[i]
+		num_bone_keys = len(bone_keys)
 
-		if num_bone_values != 0:
-			# Compute averages if is needed
-			if NUM_FRAMES_AVERAGE != 1:
-				ini = 0
-				end = NUM_FRAMES_AVERAGE
-				key_idx = 0
+		if num_bone_keys != 0:
+			# Compute averages if are needed
+			if MAX_KEYS_PER_SECOND != 1:
+				previous_time = int(bone_keys[0][0])
+				ini_key_idx = 0
+				key_idx = 1
+				num_keys_in_second = 1
+				result_idx = 0
+				is_last = key_idx >= num_bone_keys
 
-				is_last = end >= num_bone_values
-				while not is_last:
-					is_last = end >= num_bone_values
-					bone_values[key_idx] = bone_values_average(bone_values[ini:end], is_last)
-					ini += NUM_FRAMES_AVERAGE
-					end = min(end + NUM_FRAMES_AVERAGE, num_bone_values)
+				while key_idx < num_bone_keys:
+					time = bone_keys[key_idx][0]
+					num_keys_in_second += 1
+					is_last = (key_idx + 1) >= num_bone_keys
+					# If a second has passed or more keys than MAX_KEYS_PER_SECOND or is_last => compute the average
+					if time >= previous_time + 1 or num_keys_in_second == MAX_KEYS_PER_SECOND or is_last:
+						previous_time = time
+						num_keys_in_second = 0
+						bone_keys[result_idx] = bone_values_average(bone_keys[ini_key_idx:key_idx + 1], is_last)
+						ini_key_idx = key_idx + 1
+						result_idx += 1
+
 					key_idx += 1
 
-				# Update bone values, only catching the averages values
-				bones_values[i] = bone_values = bone_values[:key_idx]
+				# Update bone keys, only catching the averages values
+				bones_values[i] = bone_keys = bone_keys[:result_idx]
 
-			# Compute slope
-			for key_idx, key_value in enumerate(bone_values):
-				key_value[2] = compute_slope(bone_values, key_idx)
+			# Compute slopes
+			for key_idx, key_value in enumerate(bone_keys):
+				key_value[2] = compute_slope(bone_keys, key_idx)
 
 
 def bone_values_average(bone_values, is_last=False):
 	average = [0, 0, 0]
 
-	# Set time and check if is first or is_last
+	# Set time and check if is_first or is_last
 	is_first = bone_values[0][0] == 0
 	compute_time_average = not(is_first or is_last)
-	if not is_first and is_last:
+	if is_first:
+		average[0] = 0
+	elif is_last:
 		average[0] = bone_values[-1][0]
 
 	# Sum values
@@ -373,16 +381,17 @@ def main(in_path, out_path, bones_settings):
 
 
 if __name__ == "__main__":
-	IN_PATH = "E:/PROYECTOS/Pose2Anim/Input/Benet.mp4"
-	OUT_PATH = "E:/PROYECTOS/1-UNITY/Pose2Anim/Assets/Cop"
-	BONES_SETTINGS = [(0, 15.5, -1, 'bone_1/bone_2/bone_3', 0),
-	                  (2, 3, -1, 'bone_1/bone_2/bone_6', 180),
-	                  (3, 4, 1, 'bone_1/bone_2/bone_6/bone_7', 0),
-	                  (5, 6, -1, 'bone_1/bone_2/bone_4', 180),
-	                  (6, 7, 3, 'bone_1/bone_2/bone_4/bone_5', 0),
-	                  (9, 10, -1, 'bone_1/bone_8', 0),
-	                  (10, 11, 5, 'bone_1/bone_8/bone_9', 0),
-	                  (12, 13, -1, 'bone_1/bone_10', 0),
-	                  (13, 14, 7, 'bone_1/bone_10/bone_11', 0)]
+	IN_PATH = "E:/PROYECTOS/Pose2Anim/Input/Body.mp4"
+	OUT_PATH = "E:/PROYECTOS/Pose2Anim/Pose2AnimUnity/Assets/Animations"
+	BONES_SETTINGS = [(8, 1, -1, 'bone_1/bone_2', 0),
+	                  (0, 15.5, 0, 'bone_1/bone_2/bone_3', 0),
+	                  (2, 3, 0, 'bone_1/bone_2/bone_6', 180),
+	                  (3, 4, 2, 'bone_1/bone_2/bone_6/bone_7', 0),
+	                  (5, 6, 0, 'bone_1/bone_2/bone_4', 180),
+	                  (6, 7, 4, 'bone_1/bone_2/bone_4/bone_5', 0),
+	                  (9, 10, 0, 'bone_1/bone_8', 0),
+	                  (10, 11, 6, 'bone_1/bone_8/bone_9', 0),
+	                  (12, 13, 0, 'bone_1/bone_10', 0),
+	                  (13, 14, 8, 'bone_1/bone_10/bone_11', 0)]
 
 	main(IN_PATH, OUT_PATH, BONES_SETTINGS)
