@@ -7,6 +7,7 @@ from string import Template
 FRAME_RATE = 25
 MIN_CONFIDENCE = 0.6
 MAX_KEYS_PER_SECOND = 5
+MIN_ANGLE_DIFF = 1
 BODY_ORIENTATION = 90
 
 OPENPOSE_PATH = "openpose"
@@ -186,7 +187,7 @@ def get_bones_values(frame_values, bones_settings, person_idx, time, bones_value
 				has_parent = len(parent_bone) > 0
 				if has_parent:
 					parent_values = parent_bone[-1]
-					has_parent = parent_values[0] == time   # Last frame is the current
+					has_parent = parent_values[0] == time  # Last frame is the current
 
 			is_correct = not needs_parent or has_parent
 			if is_correct:
@@ -254,31 +255,64 @@ def process_bones_values(bones_values):
 		num_bone_keys = len(bone_keys)
 
 		if num_bone_keys != 0:
-			# Compute averages if are needed
-			if MAX_KEYS_PER_SECOND != 1:
-				previous_time = int(bone_keys[0][0])
-				ini_key_idx = 0
+			# Remove redundant/similar keypoints if is needed
+			if MIN_ANGLE_DIFF > 0:
+				reference_angle = bone_keys[0][1]
 				key_idx = 1
-				num_keys_in_second = 1
-				result_idx = 0
-				is_last = key_idx >= num_bone_keys
+				new_keypoint_idx = 1
 
 				while key_idx < num_bone_keys:
-					time = bone_keys[key_idx][0]
-					num_keys_in_second += 1
-					is_last = (key_idx + 1) >= num_bone_keys
-					# If a second has passed or more keys than MAX_KEYS_PER_SECOND or is_last => compute the average
-					if time >= previous_time + 1 or num_keys_in_second == MAX_KEYS_PER_SECOND or is_last:
-						previous_time = time
-						num_keys_in_second = 0
-						bone_keys[result_idx] = bone_values_average(bone_keys[ini_key_idx:key_idx + 1], is_last)
-						ini_key_idx = key_idx + 1
-						result_idx += 1
+					angle = bone_keys[key_idx][1]
+					angle_diff = abs(angle - reference_angle)
+					is_last = key_idx == (num_bone_keys - 1)
+
+					# If is similar to the reference angle
+					if angle_diff < MIN_ANGLE_DIFF:
+						# Add it only if is the last keypoint
+						if is_last:
+							bone_keys[new_keypoint_idx] = bone_keys[key_idx]
+							new_keypoint_idx += 1
+					# If the similarity has ended, add the last and set a new reference angle
+					else:
+						# Don't add the first position because is already added
+						if (key_idx - 1) != 0:
+							bone_keys[new_keypoint_idx] = bone_keys[key_idx - 1]
+							new_keypoint_idx += 1
+						# Set a new reference angle
+						reference_angle = bone_keys[key_idx][1]
 
 					key_idx += 1
 
-				# Update bone keys, only catching the averages values
-				bones_values[i] = bone_keys = bone_keys[:result_idx]
+				# Update bone keys only catching the not-redundant values
+				num_bone_keys = new_keypoint_idx
+				bones_values[i] = bone_keys = bone_keys[:num_bone_keys]
+
+			# Compute averages if is needed
+			if MAX_KEYS_PER_SECOND != 1:
+				last_time = bone_keys[0][0]
+				last_key_idx = 0
+				key_idx = 0
+				num_keys_in_second = 0
+				new_keypoint_idx = 0
+
+				while key_idx < num_bone_keys:
+					time = bone_keys[key_idx][0]
+					elapsed_time = time - last_time
+					is_last = key_idx == (num_bone_keys - 1)
+					num_keys_in_second += 1
+					# Compute the average if a second has passed or num keys == MAX_KEYS_PER_SECOND or is_last
+					if elapsed_time > 1 or num_keys_in_second >= MAX_KEYS_PER_SECOND or is_last:
+						bone_keys[new_keypoint_idx] = bone_values_average(bone_keys[last_key_idx:key_idx + 1], is_last)
+						last_time = time
+						num_keys_in_second = 0
+						last_key_idx = key_idx + 1
+						new_keypoint_idx += 1
+
+					key_idx += 1
+
+				# Update bone keys only catching the averages values
+				num_bone_keys = new_keypoint_idx
+				bones_values[i] = bone_keys = bone_keys[:num_bone_keys]
 
 			# Compute slopes
 			for key_idx, key_value in enumerate(bone_keys):
@@ -290,7 +324,7 @@ def bone_values_average(bone_values, is_last=False):
 
 	# Set time and check if is_first or is_last
 	is_first = bone_values[0][0] == 0
-	compute_time_average = not(is_first or is_last)
+	compute_time_average = not (is_first or is_last)
 	if is_first:
 		average[0] = 0
 	elif is_last:
@@ -311,12 +345,14 @@ def bone_values_average(bone_values, is_last=False):
 	return average
 
 
-def compute_slope(bone_values, key_idx):
+def compute_slope(bone_keys, key_idx):
 	slope = 0
 
-	if key_idx != 0 and key_idx != len(bone_values) - 1:
-		previous_time, previous_value, previous_slope = bone_values[key_idx - 1]
-		next_time, next_value, next_slope = bone_values[key_idx + 1]
+	if key_idx != 0 and key_idx != len(bone_keys) - 1:
+		previous_time, previous_value, previous_slope = bone_keys[key_idx - 1]
+		next_time, next_value, next_slope = bone_keys[key_idx + 1]
+		if (next_time - previous_time) == 0:
+			print( bone_keys[key_idx - 1],  bone_keys[key_idx],  bone_keys[key_idx + 1])
 		slope = (next_value - previous_value) / (next_time - previous_time)
 
 	return slope
@@ -381,7 +417,7 @@ def main(in_path, out_path, bones_settings):
 
 
 if __name__ == "__main__":
-	IN_PATH = "E:/PROYECTOS/Pose2Anim/Input/Body.mp4"
+	IN_PATH = "E:/PROYECTOS/Pose2Anim/Input/Nerea.mp4"
 	OUT_PATH = "E:/PROYECTOS/Pose2Anim/Pose2AnimUnity/Assets/Animations"
 	BONES_SETTINGS = [(8, 1, -1, 'bone_1/bone_2', 0),
 	                  (0, 15.5, 0, 'bone_1/bone_2/bone_3', 0),
