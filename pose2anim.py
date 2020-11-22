@@ -6,11 +6,9 @@ from string import Template
 ############################################ CONSTANTS ############################################
 FRAME_RATE = 25
 MIN_CONFIDENCE = 0.6
-MAX_KEYS_PER_SECOND = 5
-MIN_ANGLE_DIFF = 1
-
-MAX_SMOOTH_ERROR_PERC = 0
-
+MAX_KEYS_PER_SECOND = 0
+MIN_ANGLE_DIFF = 0
+MLF_ERROR_RATIO = 0.1
 BODY_ORIENTATION = 90
 
 OPENPOSE_PATH = "openpose"
@@ -131,7 +129,7 @@ def detect_poses(in_path, out_path):
 
 
 def exe_OpenPose(in_path, out_path):
-	command = f"start bin/OpenPoseDemo.exe --keypoint_scale 3 --video {in_path} --write_json {out_path} --write_video Benet.avi"
+	command = f"start bin/OpenPoseDemo.exe --keypoint_scale 3 --video {in_path} --write_json {out_path}"
 	print(command)
 	stream = os.popen(command)
 	stream.read()
@@ -258,6 +256,8 @@ def process_bones_values(bones_values):
 		num_bone_keys = len(bone_keys)
 
 		if num_bone_keys != 0:
+			ini_num_bone_keys = num_bone_keys
+
 			# Remove redundant/similar keypoints if is needed
 			if MIN_ANGLE_DIFF > 0:
 				num_bone_keys = len(bone_keys)
@@ -286,12 +286,11 @@ def process_bones_values(bones_values):
 					key_idx += 1
 
 				# Update bone keys only catching the not-redundant values
-				num_bone_keys = new_keypoint_idx
 				bones_values[i] = bone_keys = bone_keys[:num_bone_keys]
 
 			# Smooth the values
-			if MAX_SMOOTH_ERROR_PERC > 0:
-				bones_values[i] = bone_keys = smooth_bone_keys(bone_keys)
+			if MLF_ERROR_RATIO > 0:
+				bones_values[i] = bone_keys = multiple_line_fitting(bone_keys)
 
 			# Compute averages if is needed
 			if MAX_KEYS_PER_SECOND > 0:
@@ -320,6 +319,8 @@ def process_bones_values(bones_values):
 				# Update bone keys only catching the averages values
 				num_bone_keys = new_keypoint_idx
 				bones_values[i] = bone_keys = bone_keys[:num_bone_keys]
+
+			#print(f"Processed bone keys {i}: {ini_num_bone_keys} -> {len(bone_keys)}")
 
 			# Compute slopes
 			for key_idx, key_value in enumerate(bone_keys):
@@ -352,7 +353,7 @@ def bone_values_average(bone_values, is_last=False):
 	return average
 
 
-def smooth_bone_keys(bone_keys):
+def multiple_line_fitting(bone_keys):
 	num_bone_keys = len(bone_keys)
 	new_bone_keys = [bone_keys[0], bone_keys[-1]]
 	max_error_idx = 0
@@ -372,7 +373,7 @@ def smooth_bone_keys(bone_keys):
 		key_idx += 1
 
 	values_range = max_value - min_value
-	max_smooth_error = values_range * MAX_SMOOTH_ERROR_PERC
+	max_smooth_error = values_range * MLF_ERROR_RATIO
 
 	# While any keypoint exceed the MAX_SMOOTH_ERROR
 	while max_error_idx != -1:
@@ -492,7 +493,7 @@ def main(in_path, out_path, bones_settings):
 
 
 if __name__ == "__main__":
-	IN_PATH = "E:/PROYECTOS/Pose2Anim/Input/10-seconds-of-future-dance.mp4"
+	IN_PATH = "E:/PROYECTOS/Pose2Anim/Input/Nerea.mp4"
 	OUT_PATH = "E:/PROYECTOS/Pose2Anim/Pose2AnimUnity/Assets/Animations"
 	BONES_SETTINGS = [(8, 1, -1, 'bone_1/bone_2', 0),
 	                  (0, 15.5, 0, 'bone_1/bone_2/bone_3', 0),
