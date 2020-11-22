@@ -8,6 +8,9 @@ FRAME_RATE = 25
 MIN_CONFIDENCE = 0.6
 MAX_KEYS_PER_SECOND = 5
 MIN_ANGLE_DIFF = 1
+
+MAX_SMOOTH_ERROR_PERC = 0
+
 BODY_ORIENTATION = 90
 
 OPENPOSE_PATH = "openpose"
@@ -257,6 +260,7 @@ def process_bones_values(bones_values):
 		if num_bone_keys != 0:
 			# Remove redundant/similar keypoints if is needed
 			if MIN_ANGLE_DIFF > 0:
+				num_bone_keys = len(bone_keys)
 				reference_angle = bone_keys[0][1]
 				key_idx = 1
 				new_keypoint_idx = 1
@@ -266,14 +270,12 @@ def process_bones_values(bones_values):
 					angle_diff = abs(angle - reference_angle)
 					is_last = key_idx == (num_bone_keys - 1)
 
-					# If is similar to the reference angle
-					if angle_diff < MIN_ANGLE_DIFF:
-						# Add it only if is the last keypoint
-						if is_last:
-							bone_keys[new_keypoint_idx] = bone_keys[key_idx]
-							new_keypoint_idx += 1
-					# If the similarity has ended, add the last and set a new reference angle
-					else:
+					# If is_last, add
+					if is_last:
+						bone_keys[new_keypoint_idx] = bone_keys[key_idx]
+						new_keypoint_idx += 1
+					# If the similarity has ended, add the previous keypoint (last similar) and set a new reference angle
+					elif angle_diff >= MIN_ANGLE_DIFF:
 						# Don't add the first position because is already added
 						if (key_idx - 1) != 0:
 							bone_keys[new_keypoint_idx] = bone_keys[key_idx - 1]
@@ -287,8 +289,13 @@ def process_bones_values(bones_values):
 				num_bone_keys = new_keypoint_idx
 				bones_values[i] = bone_keys = bone_keys[:num_bone_keys]
 
+			# Smooth the values
+			if MAX_SMOOTH_ERROR_PERC > 0:
+				bones_values[i] = bone_keys = smooth_bone_keys(bone_keys)
+
 			# Compute averages if is needed
-			if MAX_KEYS_PER_SECOND != 1:
+			if MAX_KEYS_PER_SECOND > 0:
+				num_bone_keys = len(bone_keys)
 				last_time = bone_keys[0][0]
 				last_key_idx = 0
 				key_idx = 0
@@ -345,6 +352,74 @@ def bone_values_average(bone_values, is_last=False):
 	return average
 
 
+def smooth_bone_keys(bone_keys):
+	num_bone_keys = len(bone_keys)
+	new_bone_keys = [bone_keys[0], bone_keys[-1]]
+	max_error_idx = 0
+
+	# Search max and min values
+	max_error = -1
+	corresponding_idx = -1
+	max_value = max(bone_keys[0][1], bone_keys[-1][1])
+	min_value = min(bone_keys[0][1], bone_keys[-1][1])
+	key_idx = 1
+	while key_idx < num_bone_keys - 1:
+		keypoint = bone_keys[key_idx]
+		if keypoint[1] > max_value:
+			max_value = keypoint[1]
+		elif keypoint[1] < min_value:
+			min_value = keypoint[1]
+		key_idx += 1
+
+	values_range = max_value - min_value
+	max_smooth_error = values_range * MAX_SMOOTH_ERROR_PERC
+
+	# While any keypoint exceed the MAX_SMOOTH_ERROR
+	while max_error_idx != -1:
+		key_idx = 1
+		max_error_idx = -1
+		max_error_val = max_smooth_error
+		max_error_kp = None
+		# Search the maximum-error keypoint
+		while key_idx < num_bone_keys - 1:
+			keypoint = bone_keys[key_idx]
+			corresponding_idx = get_corresponding_idx(new_bone_keys, keypoint[0])
+			interpolated_value = interpolate_kp_value(new_bone_keys, keypoint[0], corresponding_idx)
+			error = abs(interpolated_value - keypoint[1])
+			if error >= max_error_val:
+				max_error_idx = corresponding_idx
+				max_error_val = error
+				max_error_kp = keypoint
+			key_idx += 1
+
+		if max_error_idx != -1:
+			new_bone_keys.insert(max_error_idx, max_error_kp)
+
+	return new_bone_keys
+
+
+def get_corresponding_idx(bone_keys, time):
+	idx = 0
+	while bone_keys[idx][0] < time:
+		idx += 1
+	return idx
+
+
+def interpolate_kp_value(bone_keys, time, corresponding_idx=-1):
+	if corresponding_idx == -1:
+		corresponding_idx = get_corresponding_idx(bone_keys, time)
+
+	previous_idx = max(corresponding_idx - 1, 0)
+	previous_kp = bone_keys[previous_idx]
+	next_idx = corresponding_idx
+	next_kp = bone_keys[next_idx]
+	slope = (next_kp[1] - previous_kp[1]) / (next_kp[0] - previous_kp[0])
+	time_offset = time - previous_kp[0]
+	value = previous_kp[1] + time_offset * slope
+
+	return value
+
+
 def compute_slope(bone_keys, key_idx):
 	slope = 0
 
@@ -352,7 +427,7 @@ def compute_slope(bone_keys, key_idx):
 		previous_time, previous_value, previous_slope = bone_keys[key_idx - 1]
 		next_time, next_value, next_slope = bone_keys[key_idx + 1]
 		if (next_time - previous_time) == 0:
-			print( bone_keys[key_idx - 1],  bone_keys[key_idx],  bone_keys[key_idx + 1])
+			print(bone_keys[key_idx - 1], bone_keys[key_idx], bone_keys[key_idx + 1])
 		slope = (next_value - previous_value) / (next_time - previous_time)
 
 	return slope
@@ -417,7 +492,7 @@ def main(in_path, out_path, bones_settings):
 
 
 if __name__ == "__main__":
-	IN_PATH = "E:/PROYECTOS/Pose2Anim/Input/Nerea.mp4"
+	IN_PATH = "E:/PROYECTOS/Pose2Anim/Input/10-seconds-of-future-dance.mp4"
 	OUT_PATH = "E:/PROYECTOS/Pose2Anim/Pose2AnimUnity/Assets/Animations"
 	BONES_SETTINGS = [(8, 1, -1, 'bone_1/bone_2', 0),
 	                  (0, 15.5, 0, 'bone_1/bone_2/bone_3', 0),
