@@ -4,14 +4,7 @@ import math
 from string import Template
 
 ############################################ CONSTANTS ############################################
-FRAME_RATE = 25
-MIN_CONFIDENCE = 0.6
-MAX_KEYS_PER_SECOND = 0
-MIN_ANGLE_DIFF = 0
-MLF_ERROR_RATIO = 0.1
-BODY_ORIENTATION = 90
-
-OPENPOSE_PATH = "openpose"
+FRAME_RATE = 30
 
 ANIM_FILE_TEMPLATE = '''%YAML 1.1
 %TAG !u! tag:unity3d.com,2011:
@@ -173,7 +166,6 @@ def process_poses(in_path, out_path, bones_settings, person_idx):
 ######## Compute bones values ########
 def get_bones_values(frame_values, bones_settings, person_idx, time, bones_values):
 	contains_data = False
-	default_slope = 0
 
 	people = frame_values["people"]
 	if len(people) > person_idx:
@@ -214,7 +206,7 @@ def get_bones_values(frame_values, bones_settings, person_idx, time, bones_value
 								min_diff = diff
 								angle = possible_angle
 
-					bones_values[i].append([time, angle, default_slope])
+					bones_values[i].append([time, angle])
 
 			if is_correct and not contains_data:
 				contains_data = True
@@ -251,20 +243,23 @@ def kp_sub(a, b):
 
 ########### Process bones values ###########
 def process_bones_values(bones_values):
-	for i in range(len(bones_values)):
-		bone_keys = bones_values[i]
-		num_bone_keys = len(bone_keys)
+	ini_total_bone_keys = 0
+	end_total_bone_keys = 0
 
+	for bone_idx in range(len(bones_values)):
+		bone_keys = bones_values[bone_idx]
+		num_bone_keys = len(bone_keys)
 		if num_bone_keys != 0:
 			ini_num_bone_keys = num_bone_keys
+			ini_total_bone_keys += ini_num_bone_keys
 
-			# Remove redundant/similar keypoints if is needed
+			# Remove redundant/similar keypoints
 			if MIN_ANGLE_DIFF > 0:
 				num_bone_keys = len(bone_keys)
 				reference_angle = bone_keys[0][1]
+
 				key_idx = 1
 				new_keypoint_idx = 1
-
 				while key_idx < num_bone_keys:
 					angle = bone_keys[key_idx][1]
 					angle_diff = abs(angle - reference_angle)
@@ -286,11 +281,15 @@ def process_bones_values(bones_values):
 					key_idx += 1
 
 				# Update bone keys only catching the not-redundant values
-				bones_values[i] = bone_keys = bone_keys[:num_bone_keys]
+				bones_values[bone_idx] = bone_keys = bone_keys[:new_keypoint_idx]
 
-			# Smooth the values
-			if MLF_ERROR_RATIO > 0:
-				bones_values[i] = bone_keys = multiple_line_fitting(bone_keys)
+			# Remove high frequency trembling
+			if MIN_TREMBLING_FREQUENCY > 0:
+				bones_values[bone_idx] = bone_keys = remove_trembling(bone_keys)
+
+			# Fit the line to reduce redundancy and noise
+			if MLF_MAX_ERROR_RATIO > 0:
+				bones_values[bone_idx] = bone_keys = multiple_line_fitting(bone_keys)
 
 			# Compute averages if is needed
 			if MAX_KEYS_PER_SECOND > 0:
@@ -308,7 +307,7 @@ def process_bones_values(bones_values):
 					num_keys_in_second += 1
 					# Compute the average if a second has passed or num keys == MAX_KEYS_PER_SECOND or is_last
 					if elapsed_time > 1 or num_keys_in_second >= MAX_KEYS_PER_SECOND or is_last:
-						bone_keys[new_keypoint_idx] = bone_values_average(bone_keys[last_key_idx:key_idx + 1], is_last)
+						bone_keys[new_keypoint_idx] = bone_keys_average(bone_keys[last_key_idx:key_idx + 1], is_last)
 						last_time = time
 						num_keys_in_second = 0
 						last_key_idx = key_idx + 1
@@ -317,40 +316,17 @@ def process_bones_values(bones_values):
 					key_idx += 1
 
 				# Update bone keys only catching the averages values
-				num_bone_keys = new_keypoint_idx
-				bones_values[i] = bone_keys = bone_keys[:num_bone_keys]
-
-			#print(f"Processed bone keys {i}: {ini_num_bone_keys} -> {len(bone_keys)}")
+				bones_values[bone_idx] = bone_keys = bone_keys[:new_keypoint_idx]
 
 			# Compute slopes
-			for key_idx, key_value in enumerate(bone_keys):
-				key_value[2] = compute_slope(bone_keys, key_idx)
+			for key_idx, key in enumerate(bone_keys):
+				slope = compute_slope(bone_keys, key_idx)
+				key.append(slope)
 
+			print(f"Processed {bone_idx} bone keys: {ini_num_bone_keys} -> {len(bone_keys)}")
+			end_total_bone_keys += len(bone_keys)
 
-def bone_values_average(bone_values, is_last=False):
-	average = [0, 0, 0]
-
-	# Set time and check if is_first or is_last
-	is_first = bone_values[0][0] == 0
-	compute_time_average = not (is_first or is_last)
-	if is_first:
-		average[0] = 0
-	elif is_last:
-		average[0] = bone_values[-1][0]
-
-	# Sum values
-	for time, value, slope in bone_values:
-		if compute_time_average:
-			average[0] = average[0] + time
-		average[1] = average[1] + value
-
-	# Compute averages
-	num_values = float(len(bone_values))
-	if compute_time_average:
-		average[0] /= num_values
-	average[1] /= num_values
-
-	return average
+	print(f"Processed all bone keys: {ini_total_bone_keys} -> {end_total_bone_keys}")
 
 
 def multiple_line_fitting(bone_keys):
@@ -359,8 +335,6 @@ def multiple_line_fitting(bone_keys):
 	max_error_idx = 0
 
 	# Search max and min values
-	max_error = -1
-	corresponding_idx = -1
 	max_value = max(bone_keys[0][1], bone_keys[-1][1])
 	min_value = min(bone_keys[0][1], bone_keys[-1][1])
 	key_idx = 1
@@ -373,7 +347,7 @@ def multiple_line_fitting(bone_keys):
 		key_idx += 1
 
 	values_range = max_value - min_value
-	max_smooth_error = values_range * MLF_ERROR_RATIO
+	max_smooth_error = values_range * MLF_MAX_ERROR_RATIO
 
 	# While any keypoint exceed the MAX_SMOOTH_ERROR
 	while max_error_idx != -1:
@@ -384,8 +358,7 @@ def multiple_line_fitting(bone_keys):
 		# Search the maximum-error keypoint
 		while key_idx < num_bone_keys - 1:
 			keypoint = bone_keys[key_idx]
-			corresponding_idx = get_corresponding_idx(new_bone_keys, keypoint[0])
-			interpolated_value = interpolate_kp_value(new_bone_keys, keypoint[0], corresponding_idx)
+			interpolated_value, corresponding_idx = mlf_interpolate(new_bone_keys, keypoint[0])
 			error = abs(interpolated_value - keypoint[1])
 			if error >= max_error_val:
 				max_error_idx = corresponding_idx
@@ -399,16 +372,12 @@ def multiple_line_fitting(bone_keys):
 	return new_bone_keys
 
 
-def get_corresponding_idx(bone_keys, time):
-	idx = 0
-	while bone_keys[idx][0] < time:
-		idx += 1
-	return idx
-
-
-def interpolate_kp_value(bone_keys, time, corresponding_idx=-1):
+def mlf_interpolate(bone_keys, time, corresponding_idx=-1):
+	# Search corresponding index if is needed
 	if corresponding_idx == -1:
-		corresponding_idx = get_corresponding_idx(bone_keys, time)
+		corresponding_idx = 0
+		while bone_keys[corresponding_idx][0] < time:
+			corresponding_idx += 1
 
 	previous_idx = max(corresponding_idx - 1, 0)
 	previous_kp = bone_keys[previous_idx]
@@ -418,18 +387,78 @@ def interpolate_kp_value(bone_keys, time, corresponding_idx=-1):
 	time_offset = time - previous_kp[0]
 	value = previous_kp[1] + time_offset * slope
 
-	return value
+	return value, corresponding_idx
+
+
+def remove_trembling(bone_keys):
+	num_bone_keys = len(bone_keys)
+	new_bone_keys = [bone_keys[0]]
+
+	key_idx = 1
+	previous_kp = bone_keys[0]
+	keypoint = bone_keys[key_idx]
+	ini_wave_idx = -1
+	while key_idx < num_bone_keys - 1:
+		next_kp = bone_keys[key_idx + 1]
+		has_wave_period = (next_kp[0] - previous_kp[0]) <= MAX_TREMBLING_PERIOD # Time smaller than MAX_TREMBLING_PERIOD
+		has_wave_values = (keypoint[1] - previous_kp[1] > 0) != (next_kp[1] - keypoint[1] > 0)  # It's a wave if the slope changes
+		is_trembling_wave = has_wave_period and has_wave_values
+		if is_trembling_wave:
+			# If is the start of a trembling wave
+			if ini_wave_idx == -1:
+				ini_wave_idx = key_idx
+		else:
+			# If is end of the wave, ignore the trembling
+			if ini_wave_idx != -1:
+				ini_wave_idx = -1
+
+			# Always add if it don't belongs to a trembling wave
+			new_bone_keys.append(keypoint)
+
+		# Advance to next
+		previous_kp = keypoint
+		keypoint = next_kp
+		key_idx += 1
+
+	# Always add last keypoint
+	new_bone_keys.append(bone_keys[-1])
+
+	return new_bone_keys
+
+
+def bone_keys_average(bone_keys, is_last=False):
+	average = [0, 0]
+
+	# Set time and check if is_first or is_last
+	is_first = bone_keys[0][0] == 0
+	compute_time_average = not (is_first or is_last)
+	if is_first:
+		average[0] = 0
+	elif is_last:
+		average[0] = bone_keys[-1][0]
+
+	# Sum values
+	for time, value in bone_keys:
+		if compute_time_average:
+			average[0] = average[0] + time
+		average[1] = average[1] + value
+
+	# Compute averages
+	num_values = float(len(bone_keys))
+	if compute_time_average:
+		average[0] /= num_values
+	average[1] /= num_values
+
+	return average
 
 
 def compute_slope(bone_keys, key_idx):
 	slope = 0
 
 	if key_idx != 0 and key_idx != len(bone_keys) - 1:
-		previous_time, previous_value, previous_slope = bone_keys[key_idx - 1]
-		next_time, next_value, next_slope = bone_keys[key_idx + 1]
-		if (next_time - previous_time) == 0:
-			print(bone_keys[key_idx - 1], bone_keys[key_idx], bone_keys[key_idx + 1])
-		slope = (next_value - previous_value) / (next_time - previous_time)
+		previous_kp = bone_keys[key_idx - 1]
+		next_kp = bone_keys[key_idx + 1]
+		slope = (next_kp[1] - previous_kp[1]) / (next_kp[0] - previous_kp[0])
 
 	return slope
 
@@ -495,8 +524,9 @@ def main(in_path, out_path, bones_settings):
 if __name__ == "__main__":
 	IN_PATH = "E:/PROYECTOS/Pose2Anim/Input/Nerea.mp4"
 	OUT_PATH = "E:/PROYECTOS/Pose2Anim/Pose2AnimUnity/Assets/Animations"
+	OPENPOSE_PATH = "openpose"
 	BONES_SETTINGS = [(8, 1, -1, 'bone_1/bone_2', 0),
-	                  (0, 15.5, 0, 'bone_1/bone_2/bone_3', 0),
+	                  (1, 0, 0, 'bone_1/bone_2/bone_3', 0),
 	                  (2, 3, 0, 'bone_1/bone_2/bone_6', 180),
 	                  (3, 4, 2, 'bone_1/bone_2/bone_6/bone_7', 0),
 	                  (5, 6, 0, 'bone_1/bone_2/bone_4', 180),
@@ -505,5 +535,12 @@ if __name__ == "__main__":
 	                  (10, 11, 6, 'bone_1/bone_8/bone_9', 0),
 	                  (12, 13, 0, 'bone_1/bone_10', 0),
 	                  (13, 14, 8, 'bone_1/bone_10/bone_11', 0)]
+	MIN_CONFIDENCE = 0.6
+	MIN_ANGLE_DIFF = 0
+	MIN_TREMBLING_FREQUENCY = 7
+	MAX_TREMBLING_PERIOD = 1 / MIN_TREMBLING_FREQUENCY
+	MLF_MAX_ERROR_RATIO = 0.1
+	MAX_KEYS_PER_SECOND = 0
+	BODY_ORIENTATION = 90
 
 	main(IN_PATH, OUT_PATH, BONES_SETTINGS)
