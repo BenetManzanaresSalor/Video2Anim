@@ -1,7 +1,8 @@
 import os
-import json
-import math
+from json import load as json_load
+from math import atan2, degrees
 from string import Template
+from cv2 import VideoCapture, CAP_PROP_FPS
 
 
 ############################################ Pose2Anim ############################################
@@ -11,7 +12,6 @@ class Pose2Anim:
 	DEFAULT_MIN_TREMBLING_FREQ = 7
 	DEFAULT_MLF_MAX_ERROR_RATIO = 0.1
 	DEFAULT_MAX_KEYS_PER_SEC = 0
-	DEFAULT_FRAME_RATE = 30
 
 	ANIM_FILE_TEMPLATE = '''%YAML 1.1
 %TAG !u! tag:unity3d.com,2011:
@@ -136,7 +136,9 @@ $CURVE      m_PreInfinity: 2
 		self.out_poses_path = os.path.join(out_path, self.in_file_name)
 		self.out_poses_path = os.path.normpath(self.out_poses_path)
 
-		self.frame_rate = self.DEFAULT_FRAME_RATE    # TODO : Autodetect from input video
+		video = VideoCapture(self.in_path)
+		self.frame_rate = video.get(CAP_PROP_FPS)
+		video.release()
 
 	def set_process_settings(self, body_orientation=DEFAULT_BODY_ORIENTATION,
 	                         min_confidence=DEFAULT_MIN_CONFIDENCE,
@@ -186,7 +188,7 @@ $CURVE      m_PreInfinity: 2
 			if file_name.endswith(".json"):
 				file_path = os.path.join(poses_path, file_name)
 				with open(file_path) as frame_file:
-					frame_dict = json.load(frame_file)
+					frame_dict = json_load(frame_file)
 					time = (num_frames - max(0, first_correct_frame)) * time_per_frame
 					contains_data = self.get_bones_values(frame_dict, time, bones_settings, bones_values, person_idx)
 					if contains_data:
@@ -223,8 +225,8 @@ $CURVE      m_PreInfinity: 2
 
 					if ini and end:
 						offset = self.kp_sub(end, ini)
-						angle = math.atan2(offset[1], offset[0])
-						angle = math.degrees(angle) - self.body_orientation
+						angle = atan2(offset[1], offset[0])
+						angle = degrees(angle) - self.body_orientation
 						if has_parent:
 							angle -= parent_values[1]
 						angle = angle % 360
@@ -515,7 +517,7 @@ $CURVE      m_PreInfinity: 2
 ############################################ MAIN ############################################
 def main():
 	# Execution settings
-	in_path = "E:/PROYECTOS/Pose2Anim/Input/Nerea.mp4"
+	in_path = "E:/PROYECTOS/Pose2Anim/Input/Body.mp4"
 	out_path = "E:/PROYECTOS/Pose2Anim/Pose2AnimUnity/Assets/Animations"
 	openpose_path = "openpose"
 	bones_settings = [(8, 1, -1, 'bone_1/bone_2'),
