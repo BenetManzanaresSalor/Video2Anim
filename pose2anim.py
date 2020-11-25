@@ -11,7 +11,7 @@ class Pose2Anim:
 	DEFAULT_MIN_CONFIDENCE = 0.6
 	DEFAULT_MIN_TREMBLING_FREQ = 7
 	DEFAULT_MLF_MAX_ERROR_RATIO = 0.1
-	DEFAULT_MAX_KEYS_PER_SEC = 0
+	DEFAULT_AVG_KEYS_PER_SEC = 0
 
 	ANIM_FILE_TEMPLATE = '''%YAML 1.1
 %TAG !u! tag:unity3d.com,2011:
@@ -121,10 +121,10 @@ $CURVE      m_PreInfinity: 2
 		min_confidence = kwargs.get("min_confidence", self.DEFAULT_MIN_CONFIDENCE)
 		min_trembling_freq = kwargs.get("min_trembling_freq", self.DEFAULT_MIN_TREMBLING_FREQ)
 		mlf_max_error_ratio = kwargs.get("mlf_max_error_ratio", self.DEFAULT_MLF_MAX_ERROR_RATIO)
-		max_keys_per_sec = kwargs.get("max_keys_per_sec", self.DEFAULT_MAX_KEYS_PER_SEC)
+		avg_keys_per_sec = kwargs.get("avg_keys_per_sec", self.DEFAULT_AVG_KEYS_PER_SEC)
 		self.set_process_settings(body_orientation, min_confidence,
 		                          min_trembling_freq, mlf_max_error_ratio,
-		                          max_keys_per_sec)
+		                          avg_keys_per_sec)
 
 	def set_execution_settings(self, in_path, out_path, openpose_path, bones_settings):
 		self.in_path = in_path
@@ -144,7 +144,7 @@ $CURVE      m_PreInfinity: 2
 	                         min_confidence=DEFAULT_MIN_CONFIDENCE,
 	                         min_trembling_freq=DEFAULT_MIN_TREMBLING_FREQ,
 	                         mlf_max_error_ratio=DEFAULT_MLF_MAX_ERROR_RATIO,
-	                         max_keys_per_sec=DEFAULT_MAX_KEYS_PER_SEC):
+	                         avg_keys_per_sec=DEFAULT_AVG_KEYS_PER_SEC):
 		self.body_orientation = body_orientation
 
 		if min_confidence < 0 or min_confidence > 1:
@@ -156,10 +156,17 @@ $CURVE      m_PreInfinity: 2
 			raise AttributeError("min_trembling_freq must be greater than or equal to 0")
 		else:
 			self.min_trembling_freq = min_trembling_freq
-			self.max_trembling_period = 1 / self.min_trembling_freq if min_trembling_freq > 0 else 0
+			self.max_trembling_period = 1 / min_trembling_freq if min_trembling_freq > 0 else 0
 
-		self.mlf_max_error_ratio = mlf_max_error_ratio
-		self.max_keys_per_sec = max_keys_per_sec
+		if mlf_max_error_ratio < 0:
+			raise AttributeError("mlf_max_error_ratio must be greater than or equal to 0")
+		else:
+			self.mlf_max_error_ratio = mlf_max_error_ratio
+
+		if avg_keys_per_sec < 0:
+			raise AttributeError("avg_keys_per_sec must be greater than or equal to 0")
+		else:
+			self.max_keys_per_sec = avg_keys_per_sec
 
 	###################### Detect poses ######################
 	def detect_poses(self, in_path, out_path):
@@ -290,31 +297,7 @@ $CURVE      m_PreInfinity: 2
 
 				# Compute averages if is needed
 				if self.max_keys_per_sec > 0:
-					num_bone_keys = len(bone_keys)
-					last_time = bone_keys[0][0]
-					last_key_idx = 0
-					key_idx = 0
-					num_keys_in_second = 0
-					new_keypoint_idx = 0
-
-					while key_idx < num_bone_keys:
-						time = bone_keys[key_idx][0]
-						elapsed_time = time - last_time
-						is_last = key_idx == (num_bone_keys - 1)
-						num_keys_in_second += 1
-						# Compute the average if a second has passed or num keys == MAX_KEYS_PER_SECOND or is_last
-						if elapsed_time > 1 or num_keys_in_second >= self.max_keys_per_sec or is_last:
-							keys_for_average = bone_keys[last_key_idx:key_idx + 1]
-							bone_keys[new_keypoint_idx] = self.bone_keys_average(keys_for_average, is_last)
-							last_time = time
-							num_keys_in_second = 0
-							last_key_idx = key_idx + 1
-							new_keypoint_idx += 1
-
-						key_idx += 1
-
-					# Update bone keys only catching the averages values
-					bones_values[bone_idx] = bone_keys = bone_keys[:new_keypoint_idx]
+					bones_values[bone_idx] = bone_keys = self.check_avg_keys_per_sec(bone_keys)
 
 				# Compute slopes
 				for key_idx, key in enumerate(bone_keys):
@@ -419,27 +402,67 @@ $CURVE      m_PreInfinity: 2
 
 		return new_bone_keys
 
-	def bone_keys_average(self, bone_keys, is_last=False):
-		average = [0, 0]
+	def check_avg_keys_per_sec(self, bone_keys):
+		num_bone_keys = len(bone_keys)
+		ini_second_time = bone_keys[1][0]
+		ini_second_key_idx = 1
+		key_idx = 2
+		new_keypoint_idx = 1
 
-		# Set time and check if is_first or is_last
-		is_first = bone_keys[0][0] == 0
-		compute_time_average = not (is_first or is_last)
-		if is_first:
-			average[0] = 0
-		elif is_last:
-			average[0] = bone_keys[-1][0]
+		while key_idx < num_bone_keys - 1:
+			time = bone_keys[key_idx][0]
+			elapsed_time = time - ini_second_time
+			is_penultimate = key_idx == (num_bone_keys - 2)
+
+			if is_penultimate:
+				key_idx += 1  # Needed to include it in averages computation
+
+			# If a second passed
+			if elapsed_time > 1 or is_penultimate:
+				keys_count = key_idx - ini_second_key_idx
+				# If the key count is less than or equal to the desired
+				if keys_count <= self.max_keys_per_sec:
+					new_keypoint_idx += keys_count  # Don't modify these keys
+				# If the key count is grater than the desired
+				else:
+					num_keys_to_avg = keys_count // self.max_keys_per_sec
+					ini = ini_second_key_idx
+					end = ini + num_keys_to_avg
+					# Compute the averages
+					for i in range(0, self.max_keys_per_sec - 1):
+						keys_for_average = bone_keys[ini:end]
+						bone_keys[new_keypoint_idx] = self.bone_keys_average(keys_for_average)
+						new_keypoint_idx += 1
+						ini = end
+						end = ini + num_keys_to_avg
+
+					# Add the last average
+					keys_for_average = bone_keys[ini:key_idx]
+					bone_keys[new_keypoint_idx] = self.bone_keys_average(keys_for_average)
+					new_keypoint_idx += 1
+
+				ini_second_time = time
+				ini_second_key_idx = key_idx
+
+			key_idx += 1
+
+		# Add the last keypoint
+		bone_keys[new_keypoint_idx] = bone_keys[-1]
+		new_keypoint_idx += 1
+
+		return bone_keys[:new_keypoint_idx]
+
+	def bone_keys_average(self, bone_keys):
+		average = [0, 0]
 
 		# Sum values
 		for time, value in bone_keys:
-			if compute_time_average:
-				average[0] = average[0] + time
+			average[0] = average[0] + time
 			average[1] = average[1] + value
 
 		# Compute averages
 		num_values = float(len(bone_keys))
-		if compute_time_average:
-			average[0] /= num_values
+		average[0] /= num_values
 		average[1] /= num_values
 
 		return average
@@ -534,13 +557,13 @@ def main():
 	# Process settings
 	body_orientation = 90
 	min_confidence = 0.6
-	min_trembling_frequency = 7
-	mlf_max_error_ratio = 0.1
-	max_keys_per_second = 0
+	min_trembling_frequency = 0
+	mlf_max_error_ratio = 0
+	avg_keys_per_second = 5
 
 	pose2anim = Pose2Anim(in_path, out_path, openpose_path, bones_settings, body_orientation=body_orientation,
 	                      min_confidence=min_confidence, min_trembling_freq=min_trembling_frequency,
-	                      mlf_max_error_ratio=mlf_max_error_ratio, max_keys_per_sec=max_keys_per_second)
+	                      mlf_max_error_ratio=mlf_max_error_ratio, avg_keys_per_sec=avg_keys_per_second)
 	pose2anim.run()
 
 
