@@ -7,6 +7,7 @@ from cv2 import VideoCapture, CAP_PROP_FPS
 
 ############################################ Pose2Anim ############################################
 class Pose2Anim:
+	###################### Constants ######################
 	DEFAULT_BODY_ORIENTATION = 90
 	DEFAULT_MIN_CONFIDENCE = 0.6
 	DEFAULT_MIN_TREMBLING_FREQ = 7
@@ -114,8 +115,9 @@ $CURVE      m_PreInfinity: 2
         outWeight: 0.5
 '''
 
-	def __init__(self, in_path, out_path, openpose_path, bone_settings, **kwargs):
-		self.set_execution_settings(in_path, out_path, openpose_path, bone_settings)
+	###################### Initialization ######################
+	def __init__(self, in_path, out_path, openpose_path, bones_defs, **kwargs):
+		self.set_execution_settings(in_path, out_path, openpose_path, bones_defs)
 
 		body_orientation = kwargs.get("body_orientation", self.DEFAULT_BODY_ORIENTATION)
 		min_confidence = kwargs.get("min_confidence", self.DEFAULT_MIN_CONFIDENCE)
@@ -126,19 +128,69 @@ $CURVE      m_PreInfinity: 2
 		                          min_trembling_freq, mlf_max_error_ratio,
 		                          avg_keys_per_sec)
 
-	def set_execution_settings(self, in_path, out_path, openpose_path, bones_settings):
-		self.in_path = in_path
-		self.out_path = out_path
-		self.openpose_path = openpose_path
-		self.bones_settings = bones_settings
+	def set_execution_settings(self, in_path=None, out_path=None, openpose_path=None, bones_defs=None):
+		if in_path is not None:
+			self.in_path = in_path
+			self.in_file_name = os.path.splitext(os.path.basename(self.in_path))[0]
 
-		self.in_file_name = os.path.splitext(os.path.basename(in_path))[0]
-		self.out_poses_path = os.path.join(out_path, self.in_file_name)
-		self.out_poses_path = os.path.normpath(self.out_poses_path)
+			video = VideoCapture(self.in_path)
+			self.frame_rate = video.get(CAP_PROP_FPS)
+			video.release()
 
-		video = VideoCapture(self.in_path)
-		self.frame_rate = video.get(CAP_PROP_FPS)
-		video.release()
+		if out_path is not None:
+			self.out_path = out_path
+			self.out_poses_path = os.path.join(self.out_path, self.in_file_name)
+			self.out_poses_path = os.path.normpath(self.out_poses_path)
+
+		if openpose_path is not None:
+			self.openpose_path = openpose_path
+
+		if bones_defs is not None:
+			self.bones_defs = bones_defs
+			self.check_and_sort_bones_defs()
+
+	def check_and_sort_bones_defs(self):
+		idx = 0
+		num_bones = len(self.bones_defs)
+		is_sorted = True
+		while idx < num_bones:
+			bone_def = self.bones_defs[idx]
+			parent_idx = bone_def[2]
+			if parent_idx == idx:
+				raise AttributeError(
+					f"Bone in position {idx} of bones_defs has himself as parent \n {self.bones_defs}")
+			# If the bone_def is positioned before its parent, solve the problem
+			elif parent_idx >= 0 and idx < parent_idx:
+				if is_sorted:
+					is_sorted = False
+					self.bones_defs = self.bones_defs.copy()  # Copy the list before sort
+
+				# Move the bone_def to a correct position
+				new_bone_idx = parent_idx
+				self.bones_defs.insert(new_bone_idx, self.bones_defs.pop(idx))
+				bone_def[2] -= 1  # Now the parent is just before
+
+				# Update affected parents indexes of bones_defs
+				upd_idx = idx
+				while upd_idx < num_bones:
+					if upd_idx != new_bone_idx:
+						upd_bone = self.bones_defs[upd_idx]
+						upd_parent_idx = upd_bone[2]
+						# If the parent index is between the movement positions, needs to be changed
+						if idx <= upd_parent_idx <= new_bone_idx:
+							# If it's a child of the moved
+							if upd_parent_idx == idx:
+								upd_parent_idx = new_bone_idx
+							# If the parent is before the moved
+							else:
+								upd_parent_idx -= 1
+
+							upd_bone[2] = upd_parent_idx
+
+					upd_idx += 1
+
+				idx -= 1  # Compensate the movement
+			idx += 1
 
 	def set_process_settings(self, body_orientation=DEFAULT_BODY_ORIENTATION,
 	                         min_confidence=DEFAULT_MIN_CONFIDENCE,
@@ -181,8 +233,8 @@ $CURVE      m_PreInfinity: 2
 		stream.read()
 
 	###################### Read poses ######################
-	def read_poses(self, poses_path, bones_settings, person_idx=0):
-		bones_values = [[] for _ in range(len(bones_settings))]
+	def read_poses(self, poses_path, bones_defs, person_idx=0):
+		bones_values = [[] for _ in range(len(bones_defs))]
 		time = 0
 		duration = 0
 		num_frames = 0
@@ -197,7 +249,7 @@ $CURVE      m_PreInfinity: 2
 				with open(file_path) as frame_file:
 					frame_dict = json_load(frame_file)
 					time = (num_frames - max(0, first_correct_frame)) * time_per_frame
-					contains_data = self.get_bones_values(frame_dict, time, bones_settings, bones_values, person_idx)
+					contains_data = self.get_bones_values(frame_dict, time, bones_defs, bones_values, person_idx)
 					if contains_data:
 						if first_correct_frame == -1:
 							first_correct_frame = num_frames
@@ -207,15 +259,15 @@ $CURVE      m_PreInfinity: 2
 
 		return bones_values, duration
 
-	def get_bones_values(self, frame_dict, time, bones_settings, bones_values, person_idx=0):
+	def get_bones_values(self, frame_dict, time, bones_defs, bones_values, person_idx=0):
 		contains_data = False
 
 		people = frame_dict["people"]
 		if len(people) > person_idx:
 			keypoints = people[person_idx]["pose_keypoints_2d"]
-			for i, bone_setting in enumerate(bones_settings):
+			for i, bone_def in enumerate(bones_defs):
 				# Manage parent value
-				parent_idx = bone_setting[2]
+				parent_idx = bone_def[2]
 				needs_parent = parent_idx != -1
 				has_parent = False
 				if needs_parent:
@@ -227,8 +279,8 @@ $CURVE      m_PreInfinity: 2
 
 				is_correct = has_parent or not needs_parent
 				if is_correct:
-					ini = self.get_kp(keypoints, bone_setting[0])
-					end = self.get_kp(keypoints, bone_setting[1])
+					ini = self.get_kp(keypoints, bone_def[0])
+					end = self.get_kp(keypoints, bone_def[1])
 
 					if ini and end:
 						offset = self.kp_sub(end, ini)
@@ -478,7 +530,7 @@ $CURVE      m_PreInfinity: 2
 		return slope
 
 	########### Write animation ###########
-	def write_anim(self, bones_values, bones_settings, duration, file_path):
+	def write_anim(self, bones_values, bones_defs, duration, file_path):
 		euler_curve_tmpl = Template(self.EULER_CURVE_TEMPLATE)
 		euler_curves_str = ''
 		euler_keys_tmpl = Template(self.EULER_CURVE_KEY_TEMPLATE)
@@ -501,7 +553,7 @@ $CURVE      m_PreInfinity: 2
 					key_tmpl_values['SLOPE'] = slope
 					editor_keys_str += editor_keys_tmpl.substitute(key_tmpl_values)
 
-				curve_tmpl_values['PATH'] = bones_settings[bone_idx][3]
+				curve_tmpl_values['PATH'] = bones_defs[bone_idx][3]
 				curve_tmpl_values['CURVE'] = euler_keys_str
 				euler_curves_str += euler_curve_tmpl.substitute(curve_tmpl_values)
 				curve_tmpl_values['CURVE'] = editor_keys_str
@@ -530,9 +582,9 @@ $CURVE      m_PreInfinity: 2
 		if not os.path.exists(self.out_poses_path):
 			self.detect_poses(self.in_path, self.out_poses_path)
 
-		bones_values, duration = self.read_poses(self.out_poses_path, self.bones_settings, person_idx)
+		bones_values, duration = self.read_poses(self.out_poses_path, self.bones_defs, person_idx)
 		bones_values = self.process_bones_values(bones_values)
-		self.write_anim(bones_values, self.bones_settings, duration, self.out_anim_path)
+		self.write_anim(bones_values, self.bones_defs, duration, self.out_anim_path)
 
 		return bones_values
 
@@ -540,28 +592,28 @@ $CURVE      m_PreInfinity: 2
 ############################################ MAIN ############################################
 def main():
 	# Execution settings
-	in_path = "E:/PROYECTOS/Pose2Anim/Input/Body.mp4"
-	out_path = "E:/PROYECTOS/Pose2Anim/Pose2AnimUnity/Assets/Animations"
-	openpose_path = "openpose"
-	bones_settings = [(8, 1, -1, 'bone_1/bone_2'),
-	                  (1, 0, 0, 'bone_1/bone_2/bone_3'),
-	                  (2, 3, 0, 'bone_1/bone_2/bone_6'),
-	                  (3, 4, 2, 'bone_1/bone_2/bone_6/bone_7'),
-	                  (5, 6, 0, 'bone_1/bone_2/bone_4'),
-	                  (6, 7, 4, 'bone_1/bone_2/bone_4/bone_5'),
-	                  (9, 10, 0, 'bone_1/bone_8'),
-	                  (10, 11, 6, 'bone_1/bone_8/bone_9'),
-	                  (12, 13, 0, 'bone_1/bone_10'),
-	                  (13, 14, 8, 'bone_1/bone_10/bone_11')]
+	in_path = "../Input/Body.mp4"
+	out_path = "../Pose2AnimUnity/Assets/Animations"
+	openpose_path = "../openpose"
+	bones_defs = [[8, 1, -1, 'bone_1/bone_2'],
+	                  [1, 0, 0, 'bone_1/bone_2/bone_3'],
+	                  [5, 6, 0, 'bone_1/bone_2/bone_4'],
+	                  [6, 7, 2, 'bone_1/bone_2/bone_4/bone_5'],
+	                  [2, 3, 0, 'bone_1/bone_2/bone_6'],
+	                  [3, 4, 4, 'bone_1/bone_2/bone_6/bone_7'],
+	                  [9, 10, 0, 'bone_1/bone_8'],
+	                  [10, 11, 6, 'bone_1/bone_8/bone_9'],
+	                  [12, 13, 0, 'bone_1/bone_10'],
+	                  [13, 14, 8, 'bone_1/bone_10/bone_11']]
 
-	# Process settings
+	# Settings
 	body_orientation = 90
 	min_confidence = 0.6
-	min_trembling_frequency = 0
-	mlf_max_error_ratio = 0
-	avg_keys_per_second = 5
+	min_trembling_frequency = 7
+	mlf_max_error_ratio = 0.1
+	avg_keys_per_second = 0
 
-	pose2anim = Pose2Anim(in_path, out_path, openpose_path, bones_settings, body_orientation=body_orientation,
+	pose2anim = Pose2Anim(in_path, out_path, openpose_path, bones_defs, body_orientation=body_orientation,
 	                      min_confidence=min_confidence, min_trembling_freq=min_trembling_frequency,
 	                      mlf_max_error_ratio=mlf_max_error_ratio, avg_keys_per_sec=avg_keys_per_second)
 	pose2anim.run()

@@ -1,7 +1,2 @@
 .idea
-History
-Input
-openpose
-Output
-Pose2Anim.zip
-Pose2AnimUnity
+*.pyc
