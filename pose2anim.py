@@ -334,18 +334,22 @@ $CURVE      m_PreInfinity: 2
 
 	########### Process bones values ###########
 	def process_bones_values(self, bones_values):
+		total_time = 0
+		num_execs = 0
+		num_keys = 0
 		for bone_idx in range(len(bones_values)):
 			bone_keys = bones_values[bone_idx]
 			num_bone_keys = len(bone_keys)
 			if num_bone_keys != 0:
-
 				# Remove high frequency trembling
 				if self.min_trembling_freq > 0:
 					bones_values[bone_idx] = bone_keys = self.remove_trembling(bone_keys)
 
 				# Fit the line to reduce redundancy and noise
 				if self.mlf_max_error_ratio > 0:
-					bones_values[bone_idx] = bone_keys = self.multiple_line_fitting(bone_keys)
+					num_execs += 1
+					num_keys += len(bone_keys)
+					bones_values[bone_idx] = bone_keys = self.multi_line_fitting(bone_keys)
 
 				# Compute averages if is needed
 				if self.max_keys_per_sec > 0:
@@ -358,12 +362,12 @@ $CURVE      m_PreInfinity: 2
 
 		return bones_values
 
-	def multiple_line_fitting(self, bone_keys):
-		num_bone_keys = len(bone_keys)
+	def multi_line_fitting(self, bone_keys):
 		new_bone_keys = [bone_keys[0], bone_keys[-1]]
-		max_error_idx = 0
+		new_bone_keys_idxs = [0, len(bone_keys) - 1]
+		num_bone_keys = len(bone_keys)
 
-		# Search max and min values
+		# Search max and min values to compute the maximum error
 		max_value = max(bone_keys[0][1], bone_keys[-1][1])
 		min_value = min(bone_keys[0][1], bone_keys[-1][1])
 		key_idx = 1
@@ -376,46 +380,96 @@ $CURVE      m_PreInfinity: 2
 			key_idx += 1
 
 		values_range = max_value - min_value
-		max_smooth_error = values_range * self.mlf_max_error_ratio
+		max_error = values_range * self.mlf_max_error_ratio
 
-		# While any keypoint exceed the MAX_SMOOTH_ERROR
-		while max_error_idx != -1:
-			key_idx = 1
-			max_error_idx = -1
-			max_error_val = max_smooth_error
-			max_error_kp = None
-			# Search the maximum-error keypoint
-			while key_idx < num_bone_keys - 1:
-				keypoint = bone_keys[key_idx]
-				interpolated_value, corresponding_idx = self.mlf_interpolate(new_bone_keys, keypoint[0])
-				error = abs(interpolated_value - keypoint[1])
-				if error >= max_error_val:
-					max_error_idx = corresponding_idx
-					max_error_val = error
-					max_error_kp = keypoint
-				key_idx += 1
+		# While any keypoint exceeds the maximum error
+		max_error_keys = []
+		ini_section_idx = 1
+		mid_section_idx = num_bone_keys - 2
+		end_section_idx = mid_section_idx
+		has_errors = True
+		while has_errors:
+			# Search the maximum-error keypoints of the two parts of the section
+			first_section = bone_keys[ini_section_idx:mid_section_idx]
+			error = self.mlf_search_max_error(first_section, max_error, new_bone_keys)
+			if error[0] is not None:
+				error[0] += ini_section_idx  # Add the section offset
+				max_error_keys.append(error)
+			second_section = bone_keys[mid_section_idx:end_section_idx]
+			error = self.mlf_search_max_error(second_section, max_error, new_bone_keys)
+			if error[0] is not None:
+				error[0] += mid_section_idx  # Add the section offset
+				max_error_keys.append(error)
 
-			if max_error_idx != -1:
-				new_bone_keys.insert(max_error_idx, max_error_kp)
+			# If has some error
+			if len(max_error_keys) != 0:
+				# Get the maximum-error keypoint
+				max_error_val = -1
+				max_error_idx = -1
+				max_error_kp = None
+				corresponding_idx = -1
+				max_error_idx_to_remove = - 1
+				for idx, error in enumerate(max_error_keys):
+					error_idx, error_kp, error_val = error
+					if error_val > max_error_val:
+						max_error_idx = error_idx
+						max_error_kp = error_kp
+						max_error_val = error_val
+						corresponding_idx = self.mlf_get_corresponding_idx(max_error_kp[0], new_bone_keys)
+						max_error_idx_to_remove = idx
+
+				# Add the new keypoint
+				new_bone_keys.insert(corresponding_idx, max_error_kp)
+				new_bone_keys_idxs.insert(corresponding_idx, max_error_idx)
+				max_error_keys.pop(max_error_idx_to_remove)
+
+				# Set the new sections indexes
+				ini_section_idx = new_bone_keys_idxs[corresponding_idx - 1] + 1
+				mid_section_idx = max_error_idx
+				end_section_idx = new_bone_keys_idxs[corresponding_idx + 1]
+			else:
+				has_errors = False
 
 		return new_bone_keys
 
-	def mlf_interpolate(self, bone_keys, time, corresponding_idx=-1):
+	def mlf_search_max_error(self, bone_keys, max_error, new_bone_keys):
+		max_error_idx = None
+		max_error_kp = None
+		max_error_val = max_error
+
+		for idx, keypoint in enumerate(bone_keys):
+			interpolated_value, corresponding_idx = self.mlf_interpolate(keypoint[0], new_bone_keys)
+			error = abs(interpolated_value - keypoint[1])
+			if error >= max_error_val:
+				max_error_idx = idx
+				max_error_kp = keypoint
+				max_error_val = error
+
+		return [max_error_idx, max_error_kp, max_error_val]
+
+	def mlf_interpolate(self, time, new_bone_keys, corresponding_idx=-1):
 		# Search corresponding index if is needed
 		if corresponding_idx == -1:
-			corresponding_idx = 0
-			while bone_keys[corresponding_idx][0] < time:
+			corresponding_idx = self.mlf_get_corresponding_idx(time, new_bone_keys)
+			while new_bone_keys[corresponding_idx][0] < time:
 				corresponding_idx += 1
 
 		previous_idx = max(corresponding_idx - 1, 0)
-		previous_kp = bone_keys[previous_idx]
+		previous_kp = new_bone_keys[previous_idx]
 		next_idx = corresponding_idx
-		next_kp = bone_keys[next_idx]
+		next_kp = new_bone_keys[next_idx]
 		slope = (next_kp[1] - previous_kp[1]) / (next_kp[0] - previous_kp[0])
 		time_offset = time - previous_kp[0]
 		value = previous_kp[1] + time_offset * slope
 
 		return value, corresponding_idx
+
+	def mlf_get_corresponding_idx(self, time, new_bone_keys):
+		corresponding_idx = 0
+		while time > new_bone_keys[corresponding_idx][0]:
+			corresponding_idx += 1
+
+		return corresponding_idx
 
 	def remove_trembling(self, bone_keys):
 		num_bone_keys = len(bone_keys)
@@ -596,15 +650,15 @@ def main():
 	out_path = "../Pose2AnimUnity/Assets/Animations"
 	openpose_path = "../openpose"
 	bones_defs = [[8, 1, -1, 'bone_1/bone_2'],
-	                  [1, 0, 0, 'bone_1/bone_2/bone_3'],
-	                  [5, 6, 0, 'bone_1/bone_2/bone_4'],
-	                  [6, 7, 2, 'bone_1/bone_2/bone_4/bone_5'],
-	                  [2, 3, 0, 'bone_1/bone_2/bone_6'],
-	                  [3, 4, 4, 'bone_1/bone_2/bone_6/bone_7'],
-	                  [9, 10, 0, 'bone_1/bone_8'],
-	                  [10, 11, 6, 'bone_1/bone_8/bone_9'],
-	                  [12, 13, 0, 'bone_1/bone_10'],
-	                  [13, 14, 8, 'bone_1/bone_10/bone_11']]
+	              [1, 0, 0, 'bone_1/bone_2/bone_3'],
+	              [5, 6, 0, 'bone_1/bone_2/bone_4'],
+	              [6, 7, 2, 'bone_1/bone_2/bone_4/bone_5'],
+	              [2, 3, 0, 'bone_1/bone_2/bone_6'],
+	              [3, 4, 4, 'bone_1/bone_2/bone_6/bone_7'],
+	              [9, 10, 0, 'bone_1/bone_8'],
+	              [10, 11, 6, 'bone_1/bone_8/bone_9'],
+	              [12, 13, 0, 'bone_1/bone_10'],
+	              [13, 14, 8, 'bone_1/bone_10/bone_11']]
 
 	# Settings
 	body_orientation = 90
