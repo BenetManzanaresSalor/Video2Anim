@@ -1,8 +1,10 @@
 import os
+import subprocess
 from json import load as json_load
 from math import atan2, degrees
 from string import Template
 from cv2 import VideoCapture, CAP_PROP_FPS
+
 
 
 ############################################ Pose2Anim ############################################
@@ -13,6 +15,8 @@ class Pose2Anim:
 	DEFAULT_MIN_TREMBLING_FREQ = 7
 	DEFAULT_MLF_MAX_ERROR_RATIO = 0.1
 	DEFAULT_AVG_KEYS_PER_SEC = 0
+	OPENPOSE_RELATIVE_EXE_PATH = os.path.normpath("bin/OpenPoseDemo.exe")
+	NUM_BONE_DEF_VALUES = 4
 
 	ANIM_FILE_TEMPLATE = '''%YAML 1.1
 %TAG !u! tag:unity3d.com,2011:
@@ -115,122 +119,203 @@ $CURVE      m_PreInfinity: 2
         outWeight: 0.5
 '''
 
-	###################### Initialization ######################
-	def __init__(self, in_path, out_path, openpose_path, bones_defs, **kwargs):
-		self.set_execution_settings(in_path, out_path, openpose_path, bones_defs)
+	###################### External use ######################
+	def __init__(self, **kwargs):
+		# Set default settings
+		self.video_path = None
+		self.video_name = None
+		self.frame_rate = None
+		self.time_per_frame = None
+		self.anim_path = None
+		self.poses_path = None
+		self.openpose_path = None
+		self.bones_defs = None
+		self.body_orientation = self.DEFAULT_BODY_ORIENTATION
+		self.min_confidence = self.DEFAULT_MIN_CONFIDENCE
+		self.min_trembling_freq = self.DEFAULT_MIN_TREMBLING_FREQ
+		self.max_trembling_period = 1 / self.DEFAULT_MIN_TREMBLING_FREQ if self.DEFAULT_MIN_TREMBLING_FREQ > 0 else 0
+		self.mlf_max_error_ratio = self.DEFAULT_MLF_MAX_ERROR_RATIO
+		self.avg_keys_per_sec = self.DEFAULT_AVG_KEYS_PER_SEC
 
-		body_orientation = kwargs.get("body_orientation", self.DEFAULT_BODY_ORIENTATION)
-		min_confidence = kwargs.get("min_confidence", self.DEFAULT_MIN_CONFIDENCE)
-		min_trembling_freq = kwargs.get("min_trembling_freq", self.DEFAULT_MIN_TREMBLING_FREQ)
-		mlf_max_error_ratio = kwargs.get("mlf_max_error_ratio", self.DEFAULT_MLF_MAX_ERROR_RATIO)
-		avg_keys_per_sec = kwargs.get("avg_keys_per_sec", self.DEFAULT_AVG_KEYS_PER_SEC)
-		self.set_process_settings(body_orientation, min_confidence,
-		                          min_trembling_freq, mlf_max_error_ratio,
-		                          avg_keys_per_sec)
+		# Set the arguments settings
+		self.set_settings(**kwargs)
 
-	def set_execution_settings(self, in_path=None, out_path=None, openpose_path=None, bones_defs=None):
-		if in_path is not None:
-			self.in_path = in_path
-			self.in_file_name = os.path.splitext(os.path.basename(self.in_path))[0]
+	def set_settings(self, **kwargs):
+		# If has any setting
+		if len(kwargs) > 0:
+			video_path = kwargs.get("video_path", None)
+			anim_path = kwargs.get("anim_path", None)
+			openpose_path = kwargs.get("openpose_path", None)
+			bones_defs = kwargs.get("bones_defs", None)
+			body_orientation = kwargs.get("body_orientation", None)
+			min_confidence = kwargs.get("min_confidence", None)
+			min_trembling_freq = kwargs.get("min_trembling_freq", None)
+			mlf_max_error_ratio = kwargs.get("mlf_max_error_ratio", None)
+			avg_keys_per_sec = kwargs.get("avg_keys_per_sec", None)
 
-			video = VideoCapture(self.in_path)
-			self.frame_rate = video.get(CAP_PROP_FPS)
-			video.release()
+			if video_path is not None:
+				video_path = os.path.normpath(video_path)
+				if not os.path.exists(video_path):
+					raise AssertionError(f"video_path {video_path} does not exist")
 
-		if out_path is not None:
-			self.out_path = out_path
-			self.out_poses_path = os.path.join(self.out_path, self.in_file_name)
-			self.out_poses_path = os.path.normpath(self.out_poses_path)
+				self.video_path = video_path
+				self.video_name = os.path.splitext(os.path.basename(self.video_path))[0]
+				video = VideoCapture(self.video_path)
+				if not video.isOpened():
+					raise AssertionError(f"video_path {video_path} does not contain a video")
 
-		if openpose_path is not None:
-			self.openpose_path = openpose_path
+				self.frame_rate = video.get(CAP_PROP_FPS)
+				self.time_per_frame = 1 / self.frame_rate
+				video.release()
 
-		if bones_defs is not None:
-			self.bones_defs = bones_defs
-			self.check_and_sort_bones_defs()
+				if self.anim_path is not None:
+					self.poses_path = os.path.join(self.anim_path, self.video_name)
 
-	def check_and_sort_bones_defs(self):
-		idx = 0
-		num_bones = len(self.bones_defs)
-		is_sorted = True
-		while idx < num_bones:
-			bone_def = self.bones_defs[idx]
-			parent_idx = bone_def[2]
-			if parent_idx == idx:
-				raise AttributeError(
-					f"Bone in position {idx} of bones_defs has himself as parent \n {self.bones_defs}")
-			# If the bone_def is positioned before its parent, solve the problem
-			elif parent_idx >= 0 and idx < parent_idx:
-				if is_sorted:
-					is_sorted = False
-					self.bones_defs = self.bones_defs.copy()  # Copy the list before sort
+			if anim_path is not None:
+				anim_path = os.path.normpath(anim_path)
+				if not os.path.exists(anim_path):
+					raise AssertionError(f"anim_path {anim_path} does not exist")
 
-				# Move the bone_def to a correct position
-				new_bone_idx = parent_idx
-				self.bones_defs.insert(new_bone_idx, self.bones_defs.pop(idx))
-				bone_def[2] -= 1  # Now the parent is just before
+				self.anim_path = anim_path
 
-				# Update affected parents indexes of bones_defs
-				upd_idx = idx
-				while upd_idx < num_bones:
-					if upd_idx != new_bone_idx:
-						upd_bone = self.bones_defs[upd_idx]
-						upd_parent_idx = upd_bone[2]
-						# If the parent index is between the movement positions, needs to be changed
-						if idx <= upd_parent_idx <= new_bone_idx:
-							# If it's a child of the moved
-							if upd_parent_idx == idx:
-								upd_parent_idx = new_bone_idx
-							# If the parent is before the moved
-							else:
-								upd_parent_idx -= 1
+				if self.video_name is not None:
+					self.poses_path = os.path.join(self.anim_path, self.video_name)
 
-							upd_bone[2] = upd_parent_idx
+			if openpose_path is not None:
+				openpose_path = os.path.normpath(openpose_path)
+				if not os.path.exists(openpose_path):
+					raise AssertionError(f"openpose_path {openpose_path} does not exist")
 
-					upd_idx += 1
+				openpose_exe_path = os.path.join(openpose_path, self.OPENPOSE_RELATIVE_EXE_PATH)
+				if not os.path.exists(openpose_exe_path):
+					raise AssertionError(
+						f"openpose_path {openpose_path} does not contain {self.OPENPOSE_RELATIVE_EXE_PATH}")
 
-				idx -= 1  # Compensate the movement
-			idx += 1
+				self.openpose_path = openpose_path
 
-	def set_process_settings(self, body_orientation=DEFAULT_BODY_ORIENTATION,
-	                         min_confidence=DEFAULT_MIN_CONFIDENCE,
-	                         min_trembling_freq=DEFAULT_MIN_TREMBLING_FREQ,
-	                         mlf_max_error_ratio=DEFAULT_MLF_MAX_ERROR_RATIO,
-	                         avg_keys_per_sec=DEFAULT_AVG_KEYS_PER_SEC):
-		self.body_orientation = body_orientation
+			if bones_defs is not None:
+				bones_defs = self.check_and_sort_bones_defs(bones_defs)
+				self.bones_defs = bones_defs
 
-		if min_confidence < 0 or min_confidence > 1:
-			raise AttributeError("min_confidence must be in the range [0, 1]")
+			if body_orientation is not None:
+				self.body_orientation = body_orientation % 360
+
+			if min_confidence is not None:
+				if min_confidence < 0 or min_confidence > 1:
+					raise AssertionError("min_confidence must be in the range [0, 1]")
+				self.min_confidence = min_confidence
+
+			if min_trembling_freq is not None:
+				if min_trembling_freq < 0:
+					raise AssertionError("min_trembling_freq must be greater than or equal to 0")
+				self.min_trembling_freq = min_trembling_freq
+				self.max_trembling_period = 1 / min_trembling_freq if min_trembling_freq > 0 else 0
+
+			if mlf_max_error_ratio is not None:
+				if mlf_max_error_ratio < 0 or min_confidence > 1:
+					raise AssertionError("mlf_max_error_ratio must be in the range [0, 1]")
+				self.mlf_max_error_ratio = mlf_max_error_ratio
+
+			if avg_keys_per_sec is not None:
+				if avg_keys_per_sec < 0:
+					raise AssertionError("avg_keys_per_sec must be greater than or equal to 0")
+				self.avg_keys_per_sec = avg_keys_per_sec
+
+	def run(self, person_idx=0, **kwargs):
+		self.set_settings(**kwargs)
+		self.check_if_can_run()
+
+		self.out_anim_path = os.path.join(self.anim_path, f"{self.video_name}{person_idx}.anim")
+		self.out_anim_path = os.path.normpath(self.out_anim_path)
+
+		if not os.path.exists(self.poses_path):
+			self.detect_poses(self.video_path, self.poses_path)
+
+		bones_values, duration = self.read_poses(self.poses_path, self.bones_defs, person_idx)
+		bones_values = self.process_bones_values(bones_values)
+		self.write_anim(bones_values, self.bones_defs, duration, self.out_anim_path)
+
+		return bones_values
+
+	###################### Error detection ######################
+	def check_and_sort_bones_defs(self, bones_defs):
+		if not isinstance(bones_defs, list) or len(bones_defs) == 0:
+			raise AssertionError("bones_defs must be a not-empty list, one element per bone")
 		else:
-			self.min_confidence = min_confidence
+			idx = 0
+			num_bones = len(bones_defs)
+			is_sorted = True
+			while idx < num_bones:
+				bone_def = bones_defs[idx]
+				if len(bone_def) < self.NUM_BONE_DEF_VALUES:
+					raise AssertionError(
+						f"Bone in position {idx} of bones_defs has less than {self.NUM_BONE_DEF_VALUES} values\n {bone_def}")
+				parent_idx = bone_def[2]
+				if parent_idx == idx:
+					raise AssertionError(
+						f"Bone in position {idx} of bones_defs has himself as parent \n {self.bones_defs}")
+				# If the bone_def is positioned before its parent, solve the problem
+				elif parent_idx >= 0 and idx < parent_idx:
+					if is_sorted:
+						is_sorted = False
+						bones_defs = bones_defs.copy()  # Copy the list before sort, to avoid modification of the original
 
-		if min_trembling_freq < 0:
-			raise AttributeError("min_trembling_freq must be greater than or equal to 0")
-		else:
-			self.min_trembling_freq = min_trembling_freq
-			self.max_trembling_period = 1 / min_trembling_freq if min_trembling_freq > 0 else 0
+					# Move the bone_def to a correct position
+					new_bone_idx = parent_idx
+					self.bones_defs.insert(new_bone_idx, self.bones_defs.pop(idx))
+					bone_def[2] -= 1  # Now the parent is just before
 
-		if mlf_max_error_ratio < 0:
-			raise AttributeError("mlf_max_error_ratio must be greater than or equal to 0")
-		else:
-			self.mlf_max_error_ratio = mlf_max_error_ratio
+					# Update affected parents indexes of bones_defs
+					upd_idx = idx
+					while upd_idx < num_bones:
+						if upd_idx != new_bone_idx:
+							upd_bone = self.bones_defs[upd_idx]
+							upd_parent_idx = upd_bone[2]
+							# If the parent index is between the movement positions, needs to be changed
+							if idx <= upd_parent_idx <= new_bone_idx:
+								# If it's a child of the moved
+								if upd_parent_idx == idx:
+									upd_parent_idx = new_bone_idx
+								# If the parent is before the moved
+								else:
+									upd_parent_idx -= 1
 
-		if avg_keys_per_sec < 0:
-			raise AttributeError("avg_keys_per_sec must be greater than or equal to 0")
-		else:
-			self.max_keys_per_sec = avg_keys_per_sec
+								upd_bone[2] = upd_parent_idx
+
+						upd_idx += 1
+
+					idx -= 1  # Compensate the movement
+				idx += 1
+
+		return bones_defs
+
+	def check_if_can_run(self):
+		message = " must be assigned before run. " + \
+		          "Add it as keyword argument at run, set_setting or constructor methods."
+
+		if self.video_path is None:
+			raise AssertionError("video_path" + message)
+		if self.anim_path is None:
+			raise AssertionError("anim_path" + message)
+		if self.openpose_path is None:
+			raise AssertionError("openpose_path" + message)
+		if self.bones_defs is None:
+			raise AssertionError("bones_defs" + message)
 
 	###################### Detect poses ######################
 	def detect_poses(self, in_path, out_path):
 		current_path = os.getcwd()
 		os.chdir(self.openpose_path)
-		self.exe_openpose(in_path, out_path)
-		os.chdir(current_path)
+		try:
+			self.exe_openpose(in_path, out_path)
+		except Exception as exc:
+			raise Exception(f"Problem executing OpenPose: {exc}", exc)
+		finally:
+			os.chdir(current_path)
 
 	def exe_openpose(self, in_path, out_path):
-		command = f"start bin/OpenPoseDemo.exe --keypoint_scale 3 --video {in_path} --write_json {out_path}"
-		stream = os.popen(command)
-		stream.read()
+		command = f"{self.OPENPOSE_RELATIVE_EXE_PATH} --keypoint_scale 3 --video {in_path} --write_json {out_path}"
+		subprocess.run(command, shell=True, check=True)
 
 	###################### Read poses ######################
 	def read_poses(self, poses_path, bones_defs, person_idx=0):
@@ -239,7 +324,6 @@ $CURVE      m_PreInfinity: 2
 		duration = 0
 		num_frames = 0
 		first_correct_frame = -1
-		time_per_frame = 1 / self.frame_rate
 
 		# Read bones values
 		file_names = os.listdir(poses_path)
@@ -248,7 +332,7 @@ $CURVE      m_PreInfinity: 2
 				file_path = os.path.join(poses_path, file_name)
 				with open(file_path) as frame_file:
 					frame_dict = json_load(frame_file)
-					time = (num_frames - max(0, first_correct_frame)) * time_per_frame
+					time = (num_frames - max(0, first_correct_frame)) * self.time_per_frame
 					contains_data = self.get_bones_values(frame_dict, time, bones_defs, bones_values, person_idx)
 					if contains_data:
 						if first_correct_frame == -1:
@@ -259,7 +343,7 @@ $CURVE      m_PreInfinity: 2
 
 		return bones_values, duration
 
-	def get_bones_values(self, frame_dict, time, bones_defs, bones_values, person_idx=0):
+	def get_bones_values(self, frame_dict, time, bones_defs, bones_values, person_idx):
 		contains_data = False
 
 		people = frame_dict["people"]
@@ -270,6 +354,7 @@ $CURVE      m_PreInfinity: 2
 				parent_idx = bone_def[2]
 				needs_parent = parent_idx != -1
 				has_parent = False
+				parent_values = None
 				if needs_parent:
 					parent_bone = bones_values[parent_idx]
 					has_parent = len(parent_bone) > 0
@@ -352,7 +437,7 @@ $CURVE      m_PreInfinity: 2
 					bones_values[bone_idx] = bone_keys = self.multi_line_fitting(bone_keys)
 
 				# Compute averages if is needed
-				if self.max_keys_per_sec > 0:
+				if self.avg_keys_per_sec > 0:
 					bones_values[bone_idx] = bone_keys = self.check_avg_keys_per_sec(bone_keys)
 
 				# Compute slopes
@@ -527,15 +612,15 @@ $CURVE      m_PreInfinity: 2
 			if elapsed_time > 1 or is_penultimate:
 				keys_count = key_idx - ini_second_key_idx
 				# If the key count is less than or equal to the desired
-				if keys_count <= self.max_keys_per_sec:
+				if keys_count <= self.avg_keys_per_sec:
 					new_keypoint_idx += keys_count  # Don't modify these keys
 				# If the key count is grater than the desired
 				else:
-					num_keys_to_avg = keys_count // self.max_keys_per_sec
+					num_keys_to_avg = keys_count // self.avg_keys_per_sec
 					ini = ini_second_key_idx
 					end = ini + num_keys_to_avg
 					# Compute the averages
-					for i in range(0, self.max_keys_per_sec - 1):
+					for i in range(0, self.avg_keys_per_sec - 1):
 						keys_for_average = bone_keys[ini:end]
 						bone_keys[new_keypoint_idx] = self.bone_keys_average(keys_for_average)
 						new_keypoint_idx += 1
@@ -628,26 +713,12 @@ $CURVE      m_PreInfinity: 2
 		with open(file_path, "w") as out_file:
 			out_file.write(file_content)
 
-	########### Complete execution ###########
-	def run(self, person_idx=0):
-		self.out_anim_path = os.path.join(self.out_path, f"{self.in_file_name}{person_idx}.anim")
-		self.out_anim_path = os.path.normpath(self.out_anim_path)
-
-		if not os.path.exists(self.out_poses_path):
-			self.detect_poses(self.in_path, self.out_poses_path)
-
-		bones_values, duration = self.read_poses(self.out_poses_path, self.bones_defs, person_idx)
-		bones_values = self.process_bones_values(bones_values)
-		self.write_anim(bones_values, self.bones_defs, duration, self.out_anim_path)
-
-		return bones_values
-
 
 ############################################ MAIN ############################################
 def main():
 	# Execution settings
-	in_path = "../Input/Body.mp4"
-	out_path = "../Pose2AnimUnity/Assets/Animations"
+	video_path = "../Input/Body.mp4"
+	anim_path = "../Pose2AnimUnity/Assets/Animations"
 	openpose_path = "../openpose"
 	bones_defs = [[8, 1, -1, 'bone_1/bone_2'],
 	              [1, 0, 0, 'bone_1/bone_2/bone_3'],
@@ -667,7 +738,8 @@ def main():
 	mlf_max_error_ratio = 0.1
 	avg_keys_per_second = 0
 
-	pose2anim = Pose2Anim(in_path, out_path, openpose_path, bones_defs, body_orientation=body_orientation,
+	pose2anim = Pose2Anim(video_path=video_path, anim_path=anim_path, openpose_path=openpose_path,
+	                      bones_defs=bones_defs, body_orientation=body_orientation,
 	                      min_confidence=min_confidence, min_trembling_freq=min_trembling_frequency,
 	                      mlf_max_error_ratio=mlf_max_error_ratio, avg_keys_per_sec=avg_keys_per_second)
 	pose2anim.run()
