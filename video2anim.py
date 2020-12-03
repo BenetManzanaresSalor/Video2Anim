@@ -1,16 +1,11 @@
-"""Pose to animation
+"""
+Video to animation
 
-This program translates a video to a Unity .anim file.
-Uses the pose detection tool OpenPose and process
-the results for smooth animation.
-Multiple animations of different people can be obtained from a video.
+This program makes use of OpenPose (https://github.com/CMU-Perceptual-Computing-Lab/openpose) pose detection to
+transform a video into a 2D animation file in Unity's .anim format. Also, process
+the results for a smooth animation. Multiple animations of different people can be obtained from a video.
 
-This file contains the Pose2Anim class, which allows the process.
-An example of use is shown below:
-
-p = Pose2Anim(video_path=a, anim_path=b, openpose_path=c, bones_defs=d)
-p.run(person_idx=0)
-
+This file contains the Video2Anim class, which allows the process.
 More information can be found in the README.md or the specific methods docstrings.
 """
 
@@ -23,9 +18,9 @@ from string import Template
 from cv2 import VideoCapture, CAP_PROP_FPS
 
 
-class Pose2Anim:
+class Video2Anim:
 	"""
-	Main class of Pose2Anim.
+	Main class of Video2Anim.
 
 	The main methods are the constructor, set_settings and run.
 
@@ -185,9 +180,8 @@ $CURVE      m_PreInfinity: 2
 		:keyword video_path: Path to the video file. Video format must be compatible with OpenPose, such as .mp4 or .avi.
 		:keyword anim_path: Folder path to put the results. The results include the animation file and
 			a folder with OpenPose's .json files.
-		:keyword openpose_path: Path to the OpenPose folder. The folder must contain the bin and models folders.
-			See the README.md for more information of this folder.
-		:keyword bones_defs: List of bones to create the animation.
+		:keyword openpose_path: Path to the OpenPose folder. The folder must contain bin and models folders.
+		:keyword bones_defs: List of bones for the animation.
 			Every position must have the following values:
 				*1. Bone initial position in BODY_25 format.
 				*2. Bone end position in BODY_25 format.
@@ -199,16 +193,16 @@ $CURVE      m_PreInfinity: 2
 		:keyword min_trembling_freq: Used for trembling reduction.
 			Minimum frequency of consecutive ups and downs required to delete such keypoints.
 			See the README.md for more information.
-			By the default has a value of 7. A value of 0 disables the trembling reduction.
+			By default has a value of 7. A value of 0 disables the process.
 		:keyword mlf_max_error_ratio: Multi-line Fitting maximum error ratio. In range [0, 1].
 			The maximum permissible error in MLF in proportion to the difference between
 			the minimum and maximum value of the bone animation.
 			See the README.md for more information.
-			By the default has a value of 0.1. A value of 0 disables MLF.
+			By default has a value of 0.1. A value of 0 disables the process.
 		:keyword avg_keys_per_sec: Average keypoints per second desired.
 			If a bone has more keys during a second, the amount will be reduced computing averages.
-			This an alternative to trembling reduction and MLF, it is not recommended to use it at the same time.
-			By the default has a value of 0. Values 0 or 1 disable the process.
+			This is an alternative to trembling reduction and MLF, it is not recommended to use it at the same time.
+			By default has a value of 0, which disables the process.
 
 		:raises AssertionError: If any setting is incorrect.
 		"""
@@ -295,13 +289,14 @@ $CURVE      m_PreInfinity: 2
 
 	def run(self, person_idx=0, **kwargs):
 		"""
-		Executes the pose to animation translation following the next steps:
-		1. Assigns the settings passed as **kwargs.
-		2. Checks if the required arguments (video_path, anim_path, openpose_path and bones_defs) are defined.
-		3. Executes OpenPose with the video selected if anim_path don't contains previous results.
-		4. Read the poses of the specified person_idx from the .json results files.
+		Executes the video to animation translation following the next steps:
+		1. Assign the settings passed as **kwargs.
+		2. Check if the required arguments (video_path, anim_path, openpose_path and bones_defs) are defined.
+		3. Execute OpenPose with the video selected if anim_path contains no previous results,
+			putting the resulting .json files in a folder in anim_path with the same name as the video.
+		4. Read the poses of the specified person_idx from the .json files.
 		5. Process the poses to get a smooth animation.
-		6. Write the results in an .anim file in anim_path.
+		6. Write the results in an .anim file in anim_path, using as name the name of the video concatenated with the person index.
 
 		:param person_idx: Index of the person to create the animation. By default is 0, the first person.
 		:param kwargs: Settings to assign before execution. Can be None.
@@ -321,7 +316,7 @@ $CURVE      m_PreInfinity: 2
 			self.detect_poses(self.video_path, self.poses_path)
 
 		bones_values, duration = self.read_poses(self.poses_path, self.bones_defs, person_idx)
-		bones_values = self.process_poses(bones_values)
+		bones_values = self.process_animation(bones_values)
 		self.write_anim(bones_values, self.bones_defs, duration, self.out_anim_path)
 
 		return bones_values
@@ -407,6 +402,7 @@ $CURVE      m_PreInfinity: 2
 	###################### Detect poses ######################
 	def detect_poses(self, in_path, out_path):
 		"""Executes OpenPose with a video to obtain the poses data.
+		The working directory will be moved to openpose_path during the process.
 
 		:param in_path: Path of the video
 		:param out_path: Path where OpenPose will output the .json result files
@@ -414,8 +410,8 @@ $CURVE      m_PreInfinity: 2
 		:raises Exception: If any problem happens during the execution of OpenPose.
 		"""
 		current_path = os.getcwd()
-		os.chdir(self.openpose_path)
 		try:
+			os.chdir(self.openpose_path)
 			self.exe_openpose(in_path, out_path)
 		except Exception as exc:
 			raise Exception(f"Problem executing OpenPose: {exc}", exc)
@@ -571,8 +567,8 @@ $CURVE      m_PreInfinity: 2
 		"""
 		return [a[0] - b[0], a[1] - b[1]]
 
-	########### Process bones values ###########
-	def process_poses(self, bones_values):
+	########### Process animation ###########
+	def process_animation(self, bones_values):
 		"""
 		Process the poses keypoints to smooth the animation.
 		In order to smooth it uses multi_line_fitting, reduce_trembling and check_avg_keys_per_sec methods.
@@ -907,6 +903,8 @@ $CURVE      m_PreInfinity: 2
 		"""
 		Writes the animation to the file using the previously read and processed bones keypoints.
 		For that, it uses template strings of the .anim file which it fills with the values.
+	    The generated file is in YAML format, and defines the animation as euler_curves and editor_curves (both with the same data).
+	    The only modified attribute of the bones is the rotation of the z-axis, because it is a 2D animation.
 
 		:param bones_values: List of bones keypoints with timestamp, angle and slope.
 		:param bones_defs: Bones definitions that contains the path of each bone.
