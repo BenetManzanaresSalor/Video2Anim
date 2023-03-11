@@ -16,6 +16,10 @@ from json import load as json_load
 from math import atan2, degrees
 from string import Template
 from cv2 import VideoCapture, CAP_PROP_FPS
+import numpy as np
+from bisect import bisect
+import time
+import heapq
 
 
 class Video2Anim:
@@ -24,7 +28,7 @@ class Video2Anim:
 
 	The main methods are the constructor, set_settings and run.
 
-	The program requires the video_path (input), anim_path (output),
+	The program requires the video_path (input), output_folder (output),
 	openpose_path (for execution) and bones_defs (settings) to work.
 	These settings and more can be assigned at any of the main methods as keyword arguments,
 	and it's description can be found in set_settings method docstring.
@@ -142,7 +146,7 @@ $CURVE      m_PreInfinity: 2
         outWeight: 0.5
 '''
 
-	###################### External use ######################
+	###################### For external use ######################
 	def __init__(self, **kwargs):
 		"""
 		Constructor of the class.
@@ -157,8 +161,9 @@ $CURVE      m_PreInfinity: 2
 		self.video_name = None
 		self.frame_rate = None
 		self.time_per_frame = None
-		self.anim_path = None
-		self.poses_path = None
+		self.output_folder = None		
+		self.poses_folder = None
+		self.anim_folder = None
 		self.openpose_path = None
 		self.bones_defs = None
 		self.body_orientation = self.DEFAULT_BODY_ORIENTATION
@@ -178,8 +183,8 @@ $CURVE      m_PreInfinity: 2
 
 		:param kwargs: Settings to assign. The available settings are described below.
 		:keyword video_path: Path to the video file. Video format must be compatible with OpenPose, such as .mp4 or .avi.
-		:keyword anim_path: Folder path to put the results. The results include the animation file and
-			a folder with OpenPose's .json files.
+		:keyword output_folder: Folder path to put the results. A folder with the name of the video will be created there. 
+			Inside that folder, a Poses folder is created for containing the OpenPose's .json files. Also a Animations folder for the output .anim files.
 		:keyword openpose_path: Path to the OpenPose folder. The folder must contain bin and models folders.
 		:keyword bones_defs: List of bones for the animation.
 			Every position must have the following values:
@@ -208,9 +213,9 @@ $CURVE      m_PreInfinity: 2
 		"""
 
 		# If has any setting
-		if len(kwargs) > 0:
+		if len(kwargs):
 			video_path = kwargs.get("video_path", None)
-			anim_path = kwargs.get("anim_path", None)
+			output_folder = kwargs.get("output_folder", None)
 			openpose_path = kwargs.get("openpose_path", None)
 			bones_defs = kwargs.get("bones_defs", None)
 			body_orientation = kwargs.get("body_orientation", None)
@@ -219,12 +224,13 @@ $CURVE      m_PreInfinity: 2
 			mlf_max_error_ratio = kwargs.get("mlf_max_error_ratio", None)
 			avg_keys_per_sec = kwargs.get("avg_keys_per_sec", None)
 
+			# Input video
 			if video_path is not None:
 				video_path = os.path.normpath(video_path)
 				if not os.path.exists(video_path):
 					raise AssertionError(f"video_path {video_path} does not exist")
-
 				self.video_path = video_path
+				
 				self.video_name = os.path.splitext(os.path.basename(self.video_path))[0]
 				video = VideoCapture(self.video_path)
 				if not video.isOpened():
@@ -234,19 +240,18 @@ $CURVE      m_PreInfinity: 2
 				self.time_per_frame = 1 / self.frame_rate
 				video.release()
 
-				if self.anim_path is not None:
-					self.poses_path = os.path.join(self.anim_path, self.video_name)
+			# Output folder and subfolders
+			if output_folder is not None:
+				self.output_folder = os.path.normpath(output_folder)
+				os.makedirs(os.path.dirname(self.output_folder), exist_ok=True)
+			
+				self.poses_folder = os.path.join(self.output_folder, self.video_name, "Poses")
+				os.makedirs(os.path.dirname(self.poses_folder), exist_ok=True)
 
-			if anim_path is not None:
-				anim_path = os.path.normpath(anim_path)
-				if not os.path.exists(anim_path):
-					raise AssertionError(f"anim_path {anim_path} does not exist")
+				self.anim_folder = os.path.join(self.output_folder, self.video_name, "Animations")
+				os.makedirs(os.path.dirname(self.anim_folder), exist_ok=True)
 
-				self.anim_path = anim_path
-
-				if self.video_name is not None:
-					self.poses_path = os.path.join(self.anim_path, self.video_name)
-
+			# OpenPose
 			if openpose_path is not None:
 				openpose_path = os.path.normpath(openpose_path)
 				if not os.path.exists(openpose_path):
@@ -291,12 +296,12 @@ $CURVE      m_PreInfinity: 2
 		"""
 		Executes the video to animation translation following the next steps:
 		1. Assign the settings passed as **kwargs.
-		2. Check if the required arguments (video_path, anim_path, openpose_path and bones_defs) are defined.
-		3. Execute OpenPose with the video selected if anim_path contains no previous results,
-			putting the resulting .json files in a folder in anim_path with the same name as the video.
+		2. Check if the required arguments (video_path, output_folder, openpose_path and bones_defs) are defined.
+		3. Execute OpenPose with the video selected if output_folder contains no previous results,
+			putting the resulting .json files in output_folder/<video name>/Poses.
 		4. Read the poses of the specified person_idx from the .json files.
 		5. Process the poses to get a smooth animation.
-		6. Write the results in an .anim file in anim_path, using as name the name of the video concatenated with the person index.
+		6. Write the results in an .anim file in output_folder/<video name>/Animations, using as name the name of the video concatenated with the person index.
 
 		:param person_idx: Index of the person to create the animation. By default is 0, the first person.
 		:param kwargs: Settings to assign before execution. Can be None.
@@ -309,19 +314,22 @@ $CURVE      m_PreInfinity: 2
 		self.set_settings(**kwargs)
 		self.check_if_can_run()
 
-		self.out_anim_path = os.path.join(self.anim_path, f"{self.video_name}{person_idx}.anim")
-		self.out_anim_path = os.path.normpath(self.out_anim_path)
+		# Detect poses
+		if not os.path.exists(self.poses_folder):
+			self.detect_poses(self.video_path, self.poses_folder)
 
-		if not os.path.exists(self.poses_path):
-			self.detect_poses(self.video_path, self.poses_path)
-
-		bones_values, duration = self.read_poses(self.poses_path, self.bones_defs, person_idx)
+		# Read poses and process animation
+		bones_values, duration = self.read_poses(self.poses_folder, self.bones_defs, person_idx)
 		bones_values = self.process_animation(bones_values)
+
+		# Write animation
+		self.out_anim_path = os.path.join(self.anim_folder, f"{self.video_name}_{person_idx}.anim")
+		self.out_anim_path = os.path.normpath(self.out_anim_path)
 		self.write_anim(bones_values, self.bones_defs, duration, self.out_anim_path)
 
 		return bones_values
 
-	###################### Error detection ######################
+	###################### Error checking ######################
 	def check_and_sort_bones_defs(self, bones_defs):
 		"""
 		Checks the bones definitions list content and order.
@@ -387,19 +395,19 @@ $CURVE      m_PreInfinity: 2
 		"""Checks if all the required parameters are defined.
 		:raises AssertionError: If any required parameter is missing.
 		"""
-		message = " must be assigned before run. " + \
-		          "Add it as keyword argument at run, set_setting or constructor methods."
+		message = " setting must be assigned before run. " + \
+		          "Add it as keyword argument when calling the constructor or the methods run or set_settings."
 
 		if self.video_path is None:
 			raise AssertionError("video_path" + message)
-		if self.anim_path is None:
-			raise AssertionError("anim_path" + message)
+		if self.output_folder is None:
+			raise AssertionError("output_folder" + message)
 		if self.openpose_path is None:
 			raise AssertionError("openpose_path" + message)
 		if self.bones_defs is None:
 			raise AssertionError("bones_defs" + message)
 
-	###################### Detect poses ######################
+	###################### Detect poses (use OpenPose) ######################
 	def detect_poses(self, in_path, out_path):
 		"""Executes OpenPose with a video to obtain the poses data.
 		The working directory will be moved to openpose_path during the process.
@@ -423,15 +431,15 @@ $CURVE      m_PreInfinity: 2
 		:param in_path: Path of the video
 		:param out_path: Path where OpenPose will output the .json result files
 		"""
-		command = f"{self.OPENPOSE_RELATIVE_EXE_PATH} --keypoint_scale 3 --video {in_path} --write_json {out_path}"
+		command = f"{self.OPENPOSE_RELATIVE_EXE_PATH} --keypoint_scale 3 --video {in_path} --write_json {out_path} --output_resolution 640x360"
 		subprocess.run(command, shell=True, check=True)
 
-	###################### Read poses ######################
-	def read_poses(self, poses_path, bones_defs, person_idx=0):
+	###################### Read poses files ######################
+	def read_poses(self, poses_folder, bones_defs, person_idx=0):
 		"""
 		Reads and stores the poses from the .json files outputted by OpenPose.
 
-		:param poses_path: Folder which contains the .json files.
+		:param poses_folder: Folder which contains the .json files.
 		:param bones_defs: Bones definitions to use.
 		:param person_idx: Index of the person to create the animation. By default is 0, the first person.
 		:return: A list of lists where every position belongs to a bone.
@@ -445,10 +453,10 @@ $CURVE      m_PreInfinity: 2
 		first_correct_frame = -1
 
 		# Read bones values
-		file_names = os.listdir(poses_path)
+		file_names = os.listdir(poses_folder)
 		for file_name in file_names:
 			if file_name.endswith(".json"):
-				file_path = os.path.join(poses_path, file_name)
+				file_path = os.path.join(poses_folder, file_name)
 				with open(file_path) as frame_file:
 					frame_dict = json_load(frame_file)
 					time = (num_frames - max(0, first_correct_frame)) * self.time_per_frame
@@ -567,7 +575,7 @@ $CURVE      m_PreInfinity: 2
 		"""
 		return [a[0] - b[0], a[1] - b[1]]
 
-	########### Process animation ###########
+	########### Post-process animation ###########
 	def process_animation(self, bones_values):
 		"""
 		Process the poses keypoints to smooth the animation.
@@ -581,7 +589,6 @@ $CURVE      m_PreInfinity: 2
 		:return: A list of lists where every position belongs to a bone.
 			Each bone has a list where every element is a keypoint (timestamp, angle and slope).
 		"""
-		total_time = 0
 		num_execs = 0
 		num_keys = 0
 		for bone_idx in range(len(bones_values)):
@@ -656,148 +663,19 @@ $CURVE      m_PreInfinity: 2
 
 	def multi_line_fitting(self, bone_keys):
 		"""
-		Applies the Multi-Line Fitting algorithm to bone_keys.
+		Applies the Multi-Line Fitting algorithm (implemented in the MultiLineFitting class) to bone_keys.
 		An explanation of MLF can be found in the README.md.
 
 		:param bone_keys: A list which contains the keypoints (pair of timestamp and angle) of a bone.
 		:return: The new bone keys list processed by the MLF algorithm.
 		"""
-		new_bone_keys = [bone_keys[0], bone_keys[-1]]
-		new_bone_keys_idxs = [0, len(bone_keys) - 1]
-		num_bone_keys = len(bone_keys)
+		# Perform MultiLineFitting
+		estimated_keypoints_arr = MultiLineFitting(self.mlf_max_error_ratio)(bone_keys)
 
-		# Search max and min values to compute the maximum error
-		max_value = max(bone_keys[0][1], bone_keys[-1][1])
-		min_value = min(bone_keys[0][1], bone_keys[-1][1])
-		key_idx = 1
-		while key_idx < num_bone_keys - 1:
-			keypoint = bone_keys[key_idx]
-			if keypoint[1] > max_value:
-				max_value = keypoint[1]
-			elif keypoint[1] < min_value:
-				min_value = keypoint[1]
-			key_idx += 1
+		# Transform to list of lists
+		estimated_keypoints = [list(x) for x in estimated_keypoints_arr]	
 
-		values_range = max_value - min_value
-		max_error = values_range * self.mlf_max_error_ratio
-
-		# While any keypoint exceeds the maximum error
-		max_error_keys = []
-		ini_section_idx = 1
-		mid_section_idx = num_bone_keys - 2
-		end_section_idx = mid_section_idx
-		has_errors = True
-		while has_errors:
-			# Search the maximum-error keypoints of the two parts of the section
-			first_section = bone_keys[ini_section_idx:mid_section_idx]
-			error = self.mlf_search_max_error(first_section, max_error, new_bone_keys)
-			if error[0] is not None:
-				error[0] += ini_section_idx  # Add the section offset
-				max_error_keys.append(error)
-			second_section = bone_keys[mid_section_idx:end_section_idx]
-			error = self.mlf_search_max_error(second_section, max_error, new_bone_keys)
-			if error[0] is not None:
-				error[0] += mid_section_idx  # Add the section offset
-				max_error_keys.append(error)
-
-			# If has some error
-			if len(max_error_keys) != 0:
-				# Get the maximum-error keypoint
-				max_error_val = -1
-				max_error_idx = -1
-				max_error_kp = None
-				corresponding_idx = -1
-				max_error_idx_to_remove = - 1
-				for idx, error in enumerate(max_error_keys):
-					error_idx, error_kp, error_val = error
-					if error_val > max_error_val:
-						max_error_idx = error_idx
-						max_error_kp = error_kp
-						max_error_val = error_val
-						corresponding_idx = self.mlf_get_corresponding_idx(max_error_kp[0], new_bone_keys)
-						max_error_idx_to_remove = idx
-
-				# Add the new keypoint
-				new_bone_keys.insert(corresponding_idx, max_error_kp)
-				new_bone_keys_idxs.insert(corresponding_idx, max_error_idx)
-				max_error_keys.pop(max_error_idx_to_remove)
-
-				# Set the new sections indexes
-				ini_section_idx = new_bone_keys_idxs[corresponding_idx - 1] + 1
-				mid_section_idx = max_error_idx
-				end_section_idx = new_bone_keys_idxs[corresponding_idx + 1]
-			else:
-				has_errors = False
-
-		return new_bone_keys
-
-	def mlf_search_max_error(self, bone_keys, max_error, new_bone_keys):
-		"""
-		Search the maximum error of a list of bone keypoints.
-
-		:param bone_keys: List of bones keypoints to check.
-		:param max_error: Maximum error allowed to ignore a keypoint of the list.
-		:param new_bone_keys: Current result keypoints list of MLF. Used for interpolation.
-		:return: Returns an array with the maximum error index, keypoint and value.
-			If any error is greater than max_error, index and keypoint are None.
-		"""
-
-		max_error_idx = None
-		max_error_kp = None
-		max_error_val = max_error
-
-		for idx, keypoint in enumerate(bone_keys):
-			interpolated_value, corresponding_idx = self.mlf_interpolate(keypoint[0], new_bone_keys)
-			error = abs(interpolated_value - keypoint[1])
-			if error >= max_error_val:
-				max_error_idx = idx
-				max_error_kp = keypoint
-				max_error_val = error
-
-		return [max_error_idx, max_error_kp, max_error_val]
-
-	def mlf_interpolate(self, time, new_bone_keys, corresponding_idx=-1):
-		"""
-		Interpolates a value in new_bone_keys using the timestamp.
-
-		:param time: Timestamp for interpolation.
-		:param new_bone_keys: List of keypoints for interpolation.
-			The connection between a keypoint and the next is always a straight line.
-		:param corresponding_idx: The index of the timestamp in the keypoints list.
-			By default is -1. If its value is less than 0, will be computed.
-		:return: The interpolated value of time in the new_bone_keys list.
-		"""
-
-		# Search corresponding index if is needed
-		if corresponding_idx < 0:
-			corresponding_idx = self.mlf_get_corresponding_idx(time, new_bone_keys)
-			while new_bone_keys[corresponding_idx][0] < time:
-				corresponding_idx += 1
-
-		previous_idx = max(corresponding_idx - 1, 0)
-		previous_kp = new_bone_keys[previous_idx]
-		next_idx = corresponding_idx
-		next_kp = new_bone_keys[next_idx]
-		slope = (next_kp[1] - previous_kp[1]) / (next_kp[0] - previous_kp[0])
-		time_offset = time - previous_kp[0]
-		value = previous_kp[1] + time_offset * slope
-
-		return value, corresponding_idx
-
-	def mlf_get_corresponding_idx(self, time, new_bone_keys):
-		"""
-		Obtains the first position of new_bone_keys where the keypoint timestamp is less than the time parameter.
-
-		:param time: Time for comparation.
-		:param new_bone_keys: List of keypoints computed by MLF.
-		:return: The corresponding index.
-		"""
-
-		corresponding_idx = 0
-		while time > new_bone_keys[corresponding_idx][0]:
-			corresponding_idx += 1
-
-		return corresponding_idx
+		return estimated_keypoints
 
 	def check_avg_keys_per_sec(self, bone_keys):
 		"""
@@ -912,6 +790,7 @@ $CURVE      m_PreInfinity: 2
 		:param file_path: Path of the file to write. If the file exists, it will be overwritten.
 		"""
 
+		# Prepare templates
 		euler_curve_tmpl = Template(self.EULER_CURVE_TEMPLATE)
 		euler_curves_str = ''
 		euler_keys_tmpl = Template(self.EULER_CURVE_KEY_TEMPLATE)
@@ -923,8 +802,9 @@ $CURVE      m_PreInfinity: 2
 		curve_tmpl_values = {'CURVE': '', 'PATH': '', 'ATTR': 'localEulerAnglesRaw.z'}
 		key_tmpl_values = {'TIME': 0, 'VALUE': 0, 'SLOPE': 0}
 
+		# Process all bone values
 		for bone_idx, bone_values in enumerate(bones_values):
-			if len(bone_values) != 0:
+			if len(bone_values):
 				for time, value, slope in bone_values:
 					key_tmpl_values['TIME'] = '%.2f' % time
 					key_tmpl_values['VALUE'] = '{x: 0, y: 0, z: ' + value.__str__() + '}'
@@ -942,6 +822,7 @@ $CURVE      m_PreInfinity: 2
 				euler_keys_str = ''
 				editor_curves_str = ''
 
+		# Substitue file regions
 		file_tmpl = Template(self.ANIM_FILE_TEMPLATE)
 		anim_name = os.path.splitext(os.path.basename(file_path))[0]
 		tmpl_values = {'NAME': anim_name,
@@ -951,6 +832,85 @@ $CURVE      m_PreInfinity: 2
 		               'ATTR': 'localEulerAnglesRaw.z'}
 		file_content = file_tmpl.substitute(tmpl_values)
 
+		# Write animation file
 		os.makedirs(os.path.dirname(file_path), exist_ok=True)
 		with open(file_path, "w") as out_file:
 			out_file.write(file_content)
+
+
+class MultiLineFitting():
+	def __init__(self, max_error_ratio) -> None:
+		self.max_error_ratio = max_error_ratio
+
+	def __call__(self, keypoints):
+		keypoints = np.array(keypoints)
+		timestamps = keypoints[:, 0]
+		values = keypoints[:, 1]
+		max_error_thld = (values.max() - values.min()) * self.max_error_ratio
+
+		# Compute initial estimation and errors
+		estimation_idxs = [0, len(keypoints)-1]
+		values_estimation = np.empty_like(values)
+		self.estimate_line(keypoints[0], keypoints[-1], timestamps, values_estimation)
+		errors = values - values_estimation
+		errors = np.abs(errors, out=errors)
+		max_error_idx = errors.argmax()
+
+		# If some error is too high, perform fitting
+		if errors[max_error_idx] > max_error_thld:
+			top_errors_idxs = [max_error_idx]
+			heapq.heapify(top_errors_idxs)
+
+			# Iterative fitting			
+			while len(top_errors_idxs):
+				# Get maximum error
+				max_error_idx = heapq.heappop(top_errors_idxs)
+				error = errors[max_error_idx]
+
+				# If error is too high, adapt estimation
+				if error > max_error_thld:
+					max_error_est_idx = bisect(estimation_idxs, max_error_idx)
+					estimation_idxs.insert(max_error_est_idx, max_error_idx)
+					est_idx_left = estimation_idxs[max_error_est_idx-1]
+					est_idx_right = estimation_idxs[max_error_est_idx+1]
+
+					# New estimation line at left
+					self.estimate_line(keypoints[est_idx_left], keypoints[max_error_idx],
+						timestamps[est_idx_left:max_error_idx+1],
+						values_estimation[est_idx_left:max_error_idx+1])
+					
+					# New estimation line at right
+					self.estimate_line(keypoints[max_error_idx], keypoints[est_idx_right],
+						timestamps[max_error_idx:est_idx_right+1],
+						values_estimation[max_error_idx:est_idx_right+1])
+					
+					# Recompute errors
+					np.subtract(values[est_idx_left:est_idx_right+1], values_estimation[est_idx_left:est_idx_right+1], out=errors[est_idx_left:est_idx_right+1])
+					np.abs(errors[est_idx_left:est_idx_right+1], out=errors[est_idx_left:est_idx_right+1])
+
+					# Get maximum error at left and store it if too high
+					new_max_error_idx = errors[est_idx_left:max_error_idx].argmax()
+					new_max_error_idx += est_idx_left
+					if errors[new_max_error_idx] > max_error_thld:
+						heapq.heappush(top_errors_idxs, new_max_error_idx)
+					
+					# Get maximum error at right and store it if too high
+					new_max_error_idx = errors[max_error_idx:est_idx_right+1].argmax()
+					new_max_error_idx += max_error_idx
+					if errors[new_max_error_idx] > max_error_thld:
+						heapq.heappush(top_errors_idxs, new_max_error_idx)
+			
+		# Gather keypoints for final estimation
+		estimated_keypoints = keypoints[estimation_idxs]
+
+		return estimated_keypoints
+
+	def estimate_line(self, ini_keypoint, end_keypoint, timestamps, out):
+		time_deltas = (timestamps - ini_keypoint[0])
+		slope = (end_keypoint[1] - ini_keypoint[1]) / (end_keypoint[0] - ini_keypoint[0])
+		np.multiply(time_deltas, slope, out=out)
+		np.add(out, ini_keypoint[1], out=out)
+	
+
+if __name__=="__main__":
+	raise Exception("Main not implemented")

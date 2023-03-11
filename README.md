@@ -146,39 +146,39 @@ The execution of first three processes can be affected or disabled by the settin
 ### Trembling reduction
 The poses returned by OpenPose have usually little variations in its positions, resulting in trembling animations.
 It has been observed that many of these variations are consecutive peaks and valleys in the values, which can be seen as high frequency waves.
-This high frequencies could be avoided using a not-uniform fast fourier transform (and inverse), but that can be too time consuming and complex.
+Perhaps this high frequencies could be avoided using a not-uniform fast fourier transform (and inverse), but that can be too time consuming and complex.
 Instead, the trembling is reduced deleting consecutive peaks and valleys that have a frequency greater of equal to the **min_trembling_freq** setting.
 The process is avoided if **min_trembling_freq** is 0.
 
 ### Multi-Line Fitting
 Multi-Line Fitting is an algorithm specifically created for this project that iteratively approximates the keypoints set detecting its most defining keypoints.
 Because it uses the existing keypoints in its result, it does not affect quick movements like kicks and jumps (as keypoints averaging does).
-Following, its procedure will be described.
+In the following, its procedure will be described.
 
 First, is necessary compute an maximum tolerable error for the approximation.
 Because the ranges of values can vary, this maximum must be based on the keypoints set.
 For that, the minimum and maximum values of the keypoints are calculated.
 Then, the maximum tolerable error is described as: (maximum - minimum) * **mlf_max_error_ratio**.
-**mlf_max_error_ratio** is a setting that has a value between 0 and 1. If the value is 0 all MLF is skipped.
+The **mlf_max_error_ratio** setting is expected to have a value between 0 and 1. If the value is 0 all MLF is skipped.
+
 ![MLF_Kick_MaxMin](https://user-images.githubusercontent.com/47823656/101020417-c86a0c80-356e-11eb-97a2-d430b7de3b71.png)
 
 Then, the approximation/result is initialized only with the initial and end keypoints.
 The consequent flat line from start to finish is probably an oversimplified approximation, so the errors will be calculated.
 For each keypoint, the projection on that line is computed by linear interpolation.
 The distance/difference between the keypoint and its projection is interpreted as the error.
-Any error minor than the maximum tolerable error is ignored.
-Using this information, the maximum error keypoint is found to add to the approximation.
+Any error lower than the maximum tolerable error is ignored.
+Using this information, the maximum error keypoint is found and added to the resulting estimation.
 ![MLF_Kick_Start](https://user-images.githubusercontent.com/47823656/101021358-221f0680-3570-11eb-9c0f-6653033f88e9.png)
 
-Because the approximation has changed, the errors must be recalculated.
-But now the maximum error is computed separately for the two parts and compared later, selecting the maximum error of both.
-The nonmaximum error is stored, because that part of the approximation will not change now and can therefore be used in future iterations.
+BecaSinceuse the approximation has changed, the errors must be recalculated.
+But now the maximum error is computed separately for the two parts and compared later, selecting the maximum error of both. That keypoint is added to the approximation, and the errors for that half are recomputed. In the next iteration, the obtained errors will be compared to the previous non-maximum error (that from the other half), selecting the greater of both.
 ![MLF_Kick_Continue](https://user-images.githubusercontent.com/47823656/101021894-d91b8200-3570-11eb-9560-9b6386853102.png)
 
-This process is repeated until there are no more errors greater than the tolerable, searching in smaller sets of keypoints each time.
+This process is repeated until there are no errors greater than the threshold defined by **mlf_max_error_ratio**, searching in smaller sets of keypoints each time.
 ![MLF_Kick_Final](https://user-images.githubusercontent.com/47823656/101021926-ec2e5200-3570-11eb-8fa1-456a18069373.png)
 
-The cost of this algorithm is between *O(n)* and *O(n^2)*.
+The cost of this algorithm is up to *O(n^2)*, but runtime for short animations (<200 frames, around 3 seconds) it takes less than a milisecond.
 
 ### Keypoints averaging
 An alternative simplification process to MLF.
